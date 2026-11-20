@@ -1,0 +1,25 @@
+# Data must never be in the repo (50 MB limit, no datasets)
+dev/
+dev-answer/
+out/
+scratch/
+data/
+output/
+*.parquet
+*.duckdb
+*.duckdb.wal
+duckdb_tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Tooling / OS
+graphify-out/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
