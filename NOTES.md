@@ -488,3 +488,50 @@ Warm p20m now: split 0.85 s (the person map, 0.78 s on one thread, runs beside i
 threads), dedup 0.55 s, clicks 0.30 s, sessions 0.16 s, write 0.07 s, credit 0.07 s; ~0.45-0.5 s per run is
 outside the pipeline (an empty container run with the same flags: 0.40-0.45 s). Next: dedup without reading
 lines back (half of dedup's CPU re-splits the copies' cold lines: 7.3% of lines are copies at p20m).
+
+## One-pass work (branch `onepass`): submitted, scored 1.88 s
+
+**`22562e336647869c56032c21e3fc69f3419cbd40` scored 1.88 s on the scorer (correct)**, down from 2.47 s
+(`53dd450`, the fallback). Tag `submitted-1.88s`. Branched from `speed` at `888f0f0`.
+
+The strict one-shuffle design was set aside (copies of one event_id can carry different users, so the
+person is only known after dedup); instead each record got smaller and passes were merged.
+
+| commit | change | exactness | speed (p20m warm, local) |
+|---|---|---|---|
+| 118ae75 | 8-byte exact ID keys (6-bit codes for `0-9A-Za-z` IDs up to 10 bytes, registry for the rest) | 61/61 | pipeline 1.38-1.52 -> 1.29-1.30 s; A/B faster 6/6 |
+| 58ed6ee | dedup finds copies with a hash table | 61/61 | 1.26-1.29 s |
+| 96fb923 | campaign/day counts in dense arrays | p20m MATCH | 1.25-1.33 s |
+| c003b99 | records go straight into per-thread bucket chunks | p20m MATCH | 1.13-1.18 s |
+| 6b2872b | AVX2 splitter field loop without variable shifts | p20m MATCH | 1.03-1.11 s |
+| ffd2eef | user_daily built inside the sessions pass | 61/61 | 1.04-1.07 s |
+| a690e50 | flat dedup groups, shared-buffer Parquet strings, F2 fast path | p20m MATCH | 1.00-1.04 s |
+| e5c9ee2 | prefetch the person table | p20m MATCH | 0.94-0.98 s |
+| 0595e31 | F1 timestamps checked 8 bytes at a time (SWAR) | 61/61 x5; debug tests 28/31 (relied on release wrapping) | 0.93-0.99 s |
+| 0888f4c | explicit `wrapping_add`, test helper fix | debug + release 31/31; overflow-checked 61/61 | same |
+| e9743ea | 13-byte (F3) timestamps, SWAR | 32/32, fixtures + dev 37/37 | A/B -0.010 s, faster 4/5 |
+| 22562e3 | clicks sorted by one packed (person, ts) key | full proof below | A/B -0.056 s, faster 5/7 |
+
+Tried, not kept: year table for F1 dates (+0.014 s), `glibc.malloc.hugetlb=1` (no gain), prefetch of the
+dedup hash table (+0.011 s), adaptive MSD radix pre-split for the sessions sort (+0.015 s). All were exact.
+
+**Proof of `22562e3`.** Unit tests 33/33 debug and release (brand-new target volume: a reused one can hold a
+build newer than a fresh clone's files, so cargo skips the rebuild); 61/61 datasets (11 stage tables +
+outputs) x 5 variants (base, `NATIVE_SIMD=off`, `NATIVE_KEY_INLINE_MAX=4`, `NATIVE_DENSE_MAX_CELLS=0`,
+`NATIVE_SPAN_MAX_LEN=4`) on the image's own binary; overflow-checked release build 61/61 + p60m MATCH;
+p60m MATCH in 12 runs (12g and 10g, cold and warm, 3 each), no OOM. Fresh clone from GitHub, `--no-cache`
+build: `git rev-parse HEAD` = the full hash, 36/36 fixtures, dev MATCH (117038 + 27400 rows), binary sha256
+`b09fe2d6e9bf9f7d9a658bc7d3487477d10adb75a82243aa21cb4ad56a85d782`.
+
+**Four numbers** (medians, both as images, interleaved, this laptop; not scorer numbers):
+
+| | 53dd450 | 22562e3 |
+|---|---|---|
+| p20m warm pipeline (7 each) | 1.543 s | 1.097 s |
+| p20m warm whole run | 2.024 s | 1.562 s |
+| p20m cold whole run (5 each) | 2.552 s | 2.072 s |
+| p60m 12g cold whole run (3 each) | 9.51 s | 7.46 s |
+| p60m anon peak | 7.30 GB | 4.40 GB |
+
+Scorer / local warm whole run: 2.47 / 2.024 = 1.22 for 53dd450, 1.88 / 1.562 = 1.20 for 22562e3.
+The same binary's local p20m times drift +-15% with machine state; only interleaved A/B comparisons are used.
