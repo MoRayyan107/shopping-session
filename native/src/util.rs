@@ -84,6 +84,14 @@ pub fn cmp_nulls_last(a: Option<&[u8]>, b: Option<&[u8]>) -> Ordering {
     }
 }
 
+/// With NATIVE_PROFILE set, log a sub-step's time to stderr.
+pub fn prof(label: &str, since: &mut std::time::Instant) {
+    if std::env::var_os("NATIVE_PROFILE").is_some() {
+        eprintln!("            {:7.3}s  {label}", since.elapsed().as_secs_f64());
+    }
+    *since = std::time::Instant::now();
+}
+
 pub const PART_BITS: u32 = 8;
 
 /// Group row indices by the top PART_BITS bits of `hash(i)`: returns one Vec of indices per partition.

@@ -166,15 +166,15 @@ fn main() {
     }
 
     // Stage 6: clicks, credit, assists
-    let camps = clicks::campaign_map(&campaigns);
+    let camps = clicks::Campaigns::new(&campaigns);
     let ck = clicks::valid_clicks(&raw_clicks, &pmap, &camps, ws, we);
     clock.lap("clicks dedup + validate", ck.len());
-    let cr = clicks::credit(&parts, &ck, dump.wants("session_assist"));
+    let cr = clicks::credit(&parts, &ck, &camps, dump.wants("session_assist"));
     clock.lap(
         "credit + assists",
         format!(
             "{} credited, {} assists",
-            cr.iter().map(|c| c.credit.iter().filter(|x| x.is_some()).count()).sum::<usize>(),
+            cr.iter().map(|c| c.credit.iter().filter(|&&x| x != camps.organic).count()).sum::<usize>(),
             cr.iter().map(|c| c.assist_counts.values().sum::<i64>()).sum::<i64>()
         ),
     );
@@ -187,7 +187,7 @@ fn main() {
                 vec![
                     Col::OptStr(ck.iter().map(|c| Some(c.person.to_vec())).collect()),
                     Col::OptStr(ck.iter().map(|c| Some(c.click_id.to_vec())).collect()),
-                    Col::OptStr(ck.iter().map(|c| Some(c.campaign.to_vec())).collect()),
+                    Col::OptStr(ck.iter().map(|c| Some(camps.names[c.camp as usize].to_vec())).collect()),
                     Col::OptI64(ck.iter().map(|c| Some(c.ts)).collect()),
                 ]
             },
@@ -207,7 +207,7 @@ fn main() {
                     Col::OptDate(sc().map(|(s, _)| Some(s.day)).collect()),
                     Col::OptBool(sc().map(|(s, _)| Some(s.has_purchase)).collect()),
                     Col::OptI64(sc().map(|(s, _)| Some(s.revenue)).collect()),
-                    Col::OptStr(sc().map(|(_, c)| Some(c.unwrap_or(b"organic").to_vec())).collect()),
+                    Col::OptStr(sc().map(|(_, c)| Some(camps.names[*c as usize].to_vec())).collect()),
                 ]
             },
         );
@@ -223,7 +223,7 @@ fn main() {
                     Col::OptStr(sa().map(|(s, _)| Some(s.person.to_vec())).collect()),
                     Col::OptI64(sa().map(|(s, _)| Some(s.start)).collect()),
                     Col::OptDate(sa().map(|(s, _)| Some(s.day)).collect()),
-                    Col::OptStr(sa().map(|(_, k)| Some(k.to_vec())).collect()),
+                    Col::OptStr(sa().map(|(_, k)| Some(camps.names[k as usize].to_vec())).collect()),
                 ]
             },
         );

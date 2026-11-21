@@ -1,7 +1,7 @@
 //! Stages 5 and 7: the output tables (rules.md "Outputs"). Mirrors `pipeline/outputs.py`.
 use rayon::prelude::*;
 
-use crate::clicks::Credit;
+use crate::clicks::{key, Campaigns, Credit};
 use crate::events::PURCHASE;
 use crate::pq::{write_table, Col, USER_DAILY};
 use crate::sessions::Part;
@@ -77,32 +77,26 @@ pub struct CampaignDay<'a> {
     pub assisted: i64,
 }
 
-pub const ORGANIC: &[u8] = b"organic";
-
 /// One row per (campaign, day) that was credited or assisted; organic is the campaign "organic".
-pub fn campaign_daily<'a>(
-    parts: &[Part<'a>],
-    credit: &[Credit<'a>],
-    camps: &FxMap<&'a [u8], Option<&'a [u8]>>,
-) -> Vec<CampaignDay<'a>> {
-    let partial: Vec<FxMap<(&'a [u8], i32), [i64; 4]>> = parts
+pub fn campaign_daily<'a>(parts: &[Part<'a>], credit: &[Credit], camps: &Campaigns<'a>) -> Vec<CampaignDay<'a>> {
+    let partial: Vec<FxMap<u64, [i64; 4]>> = parts
         .par_iter()
         .zip(credit.par_iter())
         .map(|(p, c)| {
-            let mut m: FxMap<(&'a [u8], i32), [i64; 4]> = FxMap::default();
-            for (s, k) in p.sessions.iter().zip(&c.credit) {
-                let v = m.entry((k.unwrap_or(ORGANIC), s.day)).or_insert([0; 4]);
+            let mut m: FxMap<u64, [i64; 4]> = FxMap::default();
+            for (s, &k) in p.sessions.iter().zip(&c.credit) {
+                let v = m.entry(key(k, s.day)).or_insert([0; 4]);
                 v[0] += 1;
                 v[1] += s.has_purchase as i64;
                 v[2] += s.revenue;
             }
-            for (key, n) in &c.assist_counts {
-                m.entry(*key).or_insert([0; 4])[3] += n;
+            for (k, n) in &c.assist_counts {
+                m.entry(*k).or_insert([0; 4])[3] += n;
             }
             m
         })
         .collect();
-    let mut all: FxMap<(&'a [u8], i32), [i64; 4]> = FxMap::default();
+    let mut all: FxMap<u64, [i64; 4]> = FxMap::default();
     for m in partial {
         for (k, v) in m {
             let t = all.entry(k).or_insert([0; 4]);
@@ -112,14 +106,17 @@ pub fn campaign_daily<'a>(
         }
     }
     all.into_iter()
-        .map(|((campaign, day), v)| CampaignDay {
-            campaign,
-            channel: if campaign == ORGANIC { Some(ORGANIC) } else { camps.get(campaign).copied().flatten() },
-            day,
-            sessions: v[0],
-            purchasing: v[1],
-            revenue: v[2],
-            assisted: v[3],
+        .map(|(k, v)| {
+            let camp = (k >> 32) as usize;
+            CampaignDay {
+                campaign: camps.names[camp],
+                channel: camps.channels[camp],
+                day: k as u32 as i32,
+                sessions: v[0],
+                purchasing: v[1],
+                revenue: v[2],
+                assisted: v[3],
+            }
         })
         .collect()
 }

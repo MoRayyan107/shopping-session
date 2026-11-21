@@ -41,7 +41,7 @@ def expand(names):
 
 
 def run_native(names, work, ncpu, tables):
-    script = [f"export NATIVE_DUMP_TABLES={','.join(tables) or 'none'}"]
+    script = [f"export NATIVE_PROFILE=1 NATIVE_DUMP_TABLES={','.join(tables) or 'none'}"]
     for n in names:
         src = f"/fx/{n[3:]}/input" if n.startswith("fx/") else f"/data/{n}"
         safe = n.replace("/", "__")

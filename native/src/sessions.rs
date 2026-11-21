@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use crate::events::{Event, PURCHASE};
 use crate::raw::Row;
-use crate::util::{hash_bytes, partition, FxMap};
+use crate::util::{hash_bytes, partition, prof, FxMap};
 
 pub const GAP_MS: i64 = 1_800_000;
 pub const DAY_MS: i64 = 86_400_000;
@@ -56,8 +56,10 @@ pub fn sessionize<'a>(
     products: &FxMap<&'a [u8], &'a [u8]>,
 ) -> Vec<Part<'a>> {
     let person = |u: &'a [u8]| -> &'a [u8] { pmap.get(u).copied().unwrap_or(u) };
+    let mut t = std::time::Instant::now();
     let parts = partition(ev.len(), |i| Some(hash_bytes(person(ev[i].user))));
-    parts
+    prof("sessions: partition by person", &mut t);
+    let r = parts
         .into_par_iter()
         .map(|idx| {
             let mut events: Vec<PEvent<'a>> = idx
@@ -94,5 +96,7 @@ pub fn sessionize<'a>(
             }
             Part { events, sessions }
         })
-        .collect()
+        .collect();
+    prof("sessions: gather, sort, cut", &mut t);
+    r
 }
