@@ -115,7 +115,7 @@ pub const USER_DAILY: &str = "message user_daily {
 
 pub const CAMPAIGN_DAILY: &str = "message campaign_daily {
     REQUIRED BYTE_ARRAY campaign_id (STRING);
-    REQUIRED BYTE_ARRAY channel (STRING);
+    OPTIONAL BYTE_ARRAY channel (STRING);
     REQUIRED INT32 day (DATE);
     REQUIRED INT64 sessions;
     REQUIRED INT64 purchasing_sessions;

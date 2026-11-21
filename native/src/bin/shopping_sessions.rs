@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
 use shopping_sessions_native::{clicks, daily, events, links, sessions};
-use shopping_sessions_native::pq::Col;
+use shopping_sessions_native::pq::{write_table, Col, CAMPAIGN_DAILY};
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
 
@@ -37,7 +37,7 @@ impl Clock {
 
 fn main() {
     let data = env_path("DATA_DIR", "/data");
-    let _out = env_path("OUTPUT_DIR", "/output");
+    let out = env_path("OUTPUT_DIR", "/output");
     if let Some(n) = std::env::var("NCPU").ok().and_then(|s| s.parse::<usize>().ok()) {
         rayon::ThreadPoolBuilder::new().num_threads(n).build_global().expect("thread pool");
     }
@@ -169,13 +169,13 @@ fn main() {
     let camps = clicks::campaign_map(&campaigns);
     let ck = clicks::valid_clicks(&raw_clicks, &pmap, &camps, ws, we);
     clock.lap("clicks dedup + validate", ck.len());
-    let cr = clicks::credit(&parts, &ck);
+    let cr = clicks::credit(&parts, &ck, dump.wants("session_assist"));
     clock.lap(
         "credit + assists",
         format!(
             "{} credited, {} assists",
             cr.iter().map(|c| c.credit.iter().filter(|x| x.is_some()).count()).sum::<usize>(),
-            cr.iter().map(|c| c.assists.len()).sum::<usize>()
+            cr.iter().map(|c| c.assist_counts.values().sum::<i64>()).sum::<i64>()
         ),
     );
     if dump.on() {
@@ -229,6 +229,29 @@ fn main() {
         );
         clock.lap("dump stage 6", "ck_valid, session_credit, session_assist");
     }
+
+    // Stage 7: campaign_daily, self-checks, Parquet output
+    let cd = daily::campaign_daily(&parts, &cr, &camps);
+    clock.lap("campaign_daily", cd.len());
+    let n_sessions: i64 = parts.iter().map(|p| p.sessions.len() as i64).sum();
+    let ud_sessions: i64 = ud.iter().flatten().map(|r| r.sessions).sum();
+    let cd_sessions: i64 = cd.iter().map(|r| r.sessions).sum();
+    if ud_sessions != n_sessions || cd_sessions != n_sessions {
+        eprintln!("WARNING self-check: sessions {n_sessions}, user_daily {ud_sessions}, campaign_daily {cd_sessions}");
+    } else {
+        eprintln!("self-checks: ok");
+    }
+    for t in ["user_daily", "campaign_daily"] {
+        std::fs::create_dir_all(out.join(t)).expect("create output folder");
+    }
+    std::thread::scope(|s| {
+        s.spawn(|| daily::write_user_daily(&out.join("user_daily/part-0.parquet"), &ud).expect("write user_daily"));
+        s.spawn(|| {
+            write_table(&out.join("campaign_daily/part-0.parquet"), CAMPAIGN_DAILY, &daily::campaign_daily_cols(&cd))
+                .expect("write campaign_daily")
+        });
+    });
+    clock.lap("write parquet", format!("{} + {} rows", ud.iter().map(Vec::len).sum::<usize>(), cd.len()));
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());
 }

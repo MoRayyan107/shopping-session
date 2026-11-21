@@ -22,8 +22,10 @@ pub struct Click<'a> {
 /// Per session part: the credited campaign of every session (None = organic) and the assists.
 pub struct Credit<'a> {
     pub credit: Vec<Option<&'a [u8]>>,
-    /// (session index in the part, campaign), distinct per session
+    /// (session index in the part, campaign), distinct per session; only filled when `keep_assists`
     pub assists: Vec<(u32, &'a [u8])>,
+    /// assisted sessions per (campaign, day)
+    pub assist_counts: FxMap<(&'a [u8], i32), i64>,
 }
 
 fn copy_order(a: &Row<'_, 4>, b: &Row<'_, 4>) -> Ordering {
@@ -92,7 +94,7 @@ pub fn valid_clicks<'a>(
 }
 
 /// Credit and assists for every session, part by part (clicks are split with the sessions' partitioning).
-pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>]) -> Vec<Credit<'a>> {
+pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>], keep_assists: bool) -> Vec<Credit<'a>> {
     let cparts = partition(clicks.len(), |i| Some(hash_bytes(clicks[i].person)));
     assert_eq!(cparts.len(), parts.len());
     parts
@@ -112,7 +114,11 @@ pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>]) -> Vec<Credit<'a>> {
                 ranges.insert(ck[i].person, (i as u32, j as u32));
                 i = j;
             }
-            let mut out = Credit { credit: Vec::with_capacity(p.sessions.len()), assists: Vec::new() };
+            let mut out = Credit {
+                credit: Vec::with_capacity(p.sessions.len()),
+                assists: Vec::new(),
+                assist_counts: FxMap::default(),
+            };
             let mut seen: Vec<&'a [u8]> = Vec::new();
             for (si, s) in p.sessions.iter().enumerate() {
                 let Some(&(a, b)) = ranges.get(s.person) else {
@@ -142,7 +148,12 @@ pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>]) -> Vec<Credit<'a>> {
                         seen.push(c.campaign);
                     }
                 }
-                out.assists.extend(seen.iter().map(|c| (si as u32, *c)));
+                for c in &seen {
+                    *out.assist_counts.entry((*c, s.day)).or_insert(0) += 1;
+                }
+                if keep_assists {
+                    out.assists.extend(seen.iter().map(|c| (si as u32, *c)));
+                }
             }
             out
         })

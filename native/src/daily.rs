@@ -1,9 +1,11 @@
 //! Stages 5 and 7: the output tables (rules.md "Outputs"). Mirrors `pipeline/outputs.py`.
 use rayon::prelude::*;
 
+use crate::clicks::Credit;
 use crate::events::PURCHASE;
 use crate::pq::{write_table, Col, USER_DAILY};
 use crate::sessions::Part;
+use crate::util::FxMap;
 
 pub struct UserDay<'a> {
     pub user: &'a [u8],
@@ -62,6 +64,75 @@ pub fn user_daily_cols(rows: &[Vec<UserDay<'_>>]) -> Vec<Col> {
         Col::I64(all().map(|r| r.events).collect()),
         Col::I64(all().map(|r| r.revenue).collect()),
         Col::OptStr(all().map(|r| r.top.map(<[u8]>::to_vec)).collect()),
+    ]
+}
+
+pub struct CampaignDay<'a> {
+    pub campaign: &'a [u8],
+    pub channel: Option<&'a [u8]>,
+    pub day: i32,
+    pub sessions: i64,
+    pub purchasing: i64,
+    pub revenue: i64,
+    pub assisted: i64,
+}
+
+pub const ORGANIC: &[u8] = b"organic";
+
+/// One row per (campaign, day) that was credited or assisted; organic is the campaign "organic".
+pub fn campaign_daily<'a>(
+    parts: &[Part<'a>],
+    credit: &[Credit<'a>],
+    camps: &FxMap<&'a [u8], Option<&'a [u8]>>,
+) -> Vec<CampaignDay<'a>> {
+    let partial: Vec<FxMap<(&'a [u8], i32), [i64; 4]>> = parts
+        .par_iter()
+        .zip(credit.par_iter())
+        .map(|(p, c)| {
+            let mut m: FxMap<(&'a [u8], i32), [i64; 4]> = FxMap::default();
+            for (s, k) in p.sessions.iter().zip(&c.credit) {
+                let v = m.entry((k.unwrap_or(ORGANIC), s.day)).or_insert([0; 4]);
+                v[0] += 1;
+                v[1] += s.has_purchase as i64;
+                v[2] += s.revenue;
+            }
+            for (key, n) in &c.assist_counts {
+                m.entry(*key).or_insert([0; 4])[3] += n;
+            }
+            m
+        })
+        .collect();
+    let mut all: FxMap<(&'a [u8], i32), [i64; 4]> = FxMap::default();
+    for m in partial {
+        for (k, v) in m {
+            let t = all.entry(k).or_insert([0; 4]);
+            for i in 0..4 {
+                t[i] += v[i];
+            }
+        }
+    }
+    all.into_iter()
+        .map(|((campaign, day), v)| CampaignDay {
+            campaign,
+            channel: if campaign == ORGANIC { Some(ORGANIC) } else { camps.get(campaign).copied().flatten() },
+            day,
+            sessions: v[0],
+            purchasing: v[1],
+            revenue: v[2],
+            assisted: v[3],
+        })
+        .collect()
+}
+
+pub fn campaign_daily_cols(rows: &[CampaignDay<'_>]) -> Vec<Col> {
+    vec![
+        Col::Str(rows.iter().map(|r| r.campaign.to_vec()).collect()),
+        Col::OptStr(rows.iter().map(|r| r.channel.map(<[u8]>::to_vec)).collect()),
+        Col::Date(rows.iter().map(|r| r.day).collect()),
+        Col::I64(rows.iter().map(|r| r.sessions).collect()),
+        Col::I64(rows.iter().map(|r| r.purchasing).collect()),
+        Col::I64(rows.iter().map(|r| r.revenue).collect()),
+        Col::I64(rows.iter().map(|r| r.assisted).collect()),
     ]
 }
 
