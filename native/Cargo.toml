@@ -23,6 +23,8 @@ path = "src/bin/shopping_sessions.rs"
 
 [dependencies]
 rayon = "=1.10.0"
+# shared byte buffers for the Parquet writer's string values (already a dependency of parquet)
+bytes = "=1.12.2"
 memmap2 = "=0.9.5"
 # Low-level column writer only: no arrow, no compression codecs. 59.3.3 is the newest that supports Rust 1.85.
 parquet = { version = "=59.3.3", default-features = false }

@@ -14,7 +14,7 @@ use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
 use crate::ts::{parse_price, parse_ts};
-use crate::util::{cmp_nulls_last, dedup_find, for_each_in_order, prof, Chunks, FxMap, Scatter, NPARTS, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_find_into, for_each_in_order, Groups, prof, Chunks, FxMap, Scatter, NPARTS, PART_BITS};
 
 pub const VIEW: u8 = 0;
 pub const CART: u8 = 1;
@@ -222,11 +222,11 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
 pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built {
     let mut t = std::time::Instant::now();
     let ids: Vec<usize> = (0..NPARTS).collect();
-    type State = (Vec<Rec>, Vec<u64>, Scatter<Event>, usize);
+    type State = (Vec<Rec>, Vec<u64>, Scatter<Event>, usize, Groups, Vec<usize>);
     let states = for_each_in_order(
         &ids,
-        || (Vec::new(), Vec::new(), Scatter::default(), 0usize),
-        |(recs, table, events, kept): &mut State, &b| {
+        || (Vec::new(), Vec::new(), Scatter::default(), 0usize, Groups::default(), Vec::new()),
+        |(recs, table, events, kept, groups, gbuf): &mut State, &b| {
                 recs.clear();
                 by_id.take(b, recs);
                 let emit = |r: &Rec, events: &mut Scatter<Event>| {
@@ -238,17 +238,19 @@ pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built
                         );
                     }
                 };
-                let (alone, groups) = dedup_find(recs.len(), |i| recs[i].id.hash(), table);
+                dedup_find_into(recs.len(), |i| recs[i].id.hash(), table, groups);
                 // unique ids in memory order (sequential reads), then the groups of copies
                 for (i, r) in recs.iter().enumerate() {
-                    if alone[i] {
+                    if groups.alone[i] {
                         *kept += 1;
                         emit(r, events);
                     }
                 }
-                for grp in &groups {
+                for gi in 0..groups.len() {
                     // a truncated-hash group: runs of one event_id (equal keys <=> equal IDs) by ingest_ts
-                    let mut g: Vec<usize> = grp.clone();
+                    gbuf.clear();
+                    gbuf.extend(groups.group(gi).iter().map(|&k| k as usize));
+                    let g = &mut *gbuf;
                     g.sort_unstable_by_key(|&k| (recs[k].id, recs[k].ingest, k));
                     let mut a = 0;
                     while a < g.len() {

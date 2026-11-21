@@ -119,8 +119,15 @@ impl Key {
 
     /// The ID's bytes.
     pub fn to_vec(self, store: &Store<'_>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(INLINE_MAX);
+        self.append_to(store, &mut out);
+        out
+    }
+
+    /// The ID's bytes, appended to `out`.
+    #[inline]
+    pub fn append_to(self, store: &Store<'_>, out: &mut Vec<u8>) {
         if self.is_inline() {
-            let mut out = Vec::with_capacity(INLINE_MAX);
             for i in 0..INLINE_MAX {
                 let c = (self.0 >> (6 * (INLINE_MAX - 1 - i))) & 63;
                 if c == 0 {
@@ -128,9 +135,8 @@ impl Key {
                 }
                 out.push(BYTE[c as usize]);
             }
-            out
         } else {
-            store.long_bytes(self.long_index()).to_vec()
+            out.extend_from_slice(store.long_bytes(self.long_index()));
         }
     }
 }

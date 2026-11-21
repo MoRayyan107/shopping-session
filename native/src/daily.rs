@@ -1,4 +1,6 @@
 //! Stages 5 and 7: the output tables (rules.md "Outputs"). Mirrors `pipeline/outputs.py`.
+use bytes::Bytes;
+use parquet::data_type::ByteArray;
 use rayon::prelude::*;
 
 use crate::clicks::{key, Campaigns, Cells, Counts, Credit};
@@ -56,15 +58,48 @@ pub fn user_daily_part<'a>(ss: &[Session], events: &[Event], cats: &Categories<'
     out
 }
 
+/// The user_daily columns. No allocation per row: every user ID's bytes go into one shared buffer that each
+/// row's value is a slice of, and each distinct top category is one shared value.
 pub fn user_daily_cols(store: &Store<'_>, rows: &[Vec<UserDay<'_>>]) -> Vec<Col> {
     let all = || rows.iter().flatten();
+    let n = all().count();
+    let mut buf: Vec<u8> = Vec::with_capacity(n * crate::key::INLINE_MAX);
+    let mut ends: Vec<usize> = Vec::with_capacity(n);
+    for r in all() {
+        r.user.append_to(store, &mut buf);
+        ends.push(buf.len());
+    }
+    let whole = Bytes::from(buf);
+    let mut start = 0;
+    let users: Vec<ByteArray> = ends
+        .iter()
+        .map(|&e| {
+            let v = ByteArray::from(whole.slice(start..e));
+            start = e;
+            v
+        })
+        .collect();
+    // top categories are slices of the categories' names: one shared value per distinct slice
+    let mut names: FxMap<(usize, usize), Bytes> = FxMap::default();
+    let mut defs: Vec<i16> = Vec::with_capacity(n);
+    let mut tops: Vec<ByteArray> = Vec::with_capacity(n);
+    for r in all() {
+        match r.top {
+            Some(t) => {
+                defs.push(1);
+                let b = names.entry((t.as_ptr() as usize, t.len())).or_insert_with(|| Bytes::copy_from_slice(t));
+                tops.push(ByteArray::from(b.clone()));
+            }
+            None => defs.push(0),
+        }
+    }
     vec![
-        Col::Str(all().map(|r| r.user.to_vec(store)).collect()),
+        Col::Bytes(users),
         Col::Date(all().map(|r| r.day).collect()),
         Col::I64(all().map(|r| r.sessions).collect()),
         Col::I64(all().map(|r| r.events).collect()),
         Col::I64(all().map(|r| r.revenue).collect()),
-        Col::OptStr(all().map(|r| r.top.map(<[u8]>::to_vec)).collect()),
+        Col::OptBytes(tops, defs),
     ]
 }
 

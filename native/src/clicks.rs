@@ -11,7 +11,7 @@ use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::sessions::Part;
 use crate::span::{Span, Store};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, dedup_find, for_each_in_order, Chunks, FxMap, Scatter, NPARTS, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_find_into, for_each_in_order, Groups, Chunks, FxMap, Scatter, NPARTS, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -217,11 +217,11 @@ pub fn build<'a>(
     let by_id = Chunks::new(scatters);
     // pass 2: dedup each id bucket (freed once done); kept valid clicks go straight to their person bucket
     let ids: Vec<usize> = (0..NPARTS).collect();
-    type State = (Vec<Rec>, Vec<u64>, Scatter<Click>);
+    type State = (Vec<Rec>, Vec<u64>, Scatter<Click>, Groups, Vec<usize>);
     let states = for_each_in_order(
         &ids,
-        || (Vec::new(), Vec::new(), Scatter::default()),
-        |(recs, table, clicks): &mut State, &b| {
+        || (Vec::new(), Vec::new(), Scatter::default(), Groups::default(), Vec::new()),
+        |(recs, table, clicks, groups, gbuf): &mut State, &b| {
                 recs.clear();
                 by_id.take(b, recs);
                 let emit = |r: &Rec, clicks: &mut Scatter<Click>| {
@@ -230,16 +230,18 @@ pub fn build<'a>(
                         clicks.push(bucket(person.hash()), Click { person, click_id: r.id, camp: r.camp_valid & !VALID, ts: r.ts });
                     }
                 };
-                let (alone, groups) = dedup_find(recs.len(), |i| recs[i].id.hash(), table);
+                dedup_find_into(recs.len(), |i| recs[i].id.hash(), table, groups);
                 // unique ids in memory order (sequential reads), then the groups of copies
                 for (i, r) in recs.iter().enumerate() {
-                    if alone[i] {
+                    if groups.alone[i] {
                         emit(r, clicks);
                     }
                 }
-                for grp in &groups {
+                for gi in 0..groups.len() {
                     // a truncated-hash group: runs of one click_id (equal keys <=> equal IDs)
-                    let mut g: Vec<usize> = grp.clone();
+                    gbuf.clear();
+                    gbuf.extend(groups.group(gi).iter().map(|&k| k as usize));
+                    let g = &mut *gbuf;
                     g.sort_unstable_by_key(|&k| (recs[k].id, k));
                     let mut a = 0;
                     while a < g.len() {

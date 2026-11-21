@@ -56,7 +56,29 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     if s.len() == 20 && s[19] == b'Z' {
         return parse_f1(s.try_into().unwrap());
     }
+    if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') {
+        return parse_f2(s.try_into().unwrap());
+    }
     parse_ts_general(s)
+}
+
+/// F2 (`YYYY-MM-DDTHH:MM:SS+HH:MM` or `-HH:MM`) at fixed positions: the F1 checks on the first 19 bytes, then
+/// the offset (hours <= 23, minutes <= 59), exactly as `parse_ts_general`.
+#[inline(always)]
+fn parse_f2(s: &[u8; 25]) -> Option<i64> {
+    let d = |i: usize| s[i].wrapping_sub(b'0');
+    if d(20) > 9 || d(21) > 9 || s[22] != b':' || d(23) > 9 || d(24) > 9 {
+        return None;
+    }
+    let (oh, om) = ((d(20) * 10 + d(21)) as i64, (d(23) * 10 + d(24)) as i64);
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    let sign = if s[19] == b'+' { 1 } else { -1 };
+    let mut f1 = [0u8; 20];
+    f1[..19].copy_from_slice(&s[..19]);
+    f1[19] = b'Z';
+    Some(parse_f1(&f1)? - sign * (oh * 60 + om) * 60_000)
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` with every check of the general path, at fixed positions.
@@ -164,6 +186,45 @@ mod tests {
     }
 
     /// The F1 fast path against the general path: every position mutated to digits, separators and others.
+    #[test]
+    fn f2_fast_equals_general() {
+        let bases: [&[u8; 25]; 5] = [
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00+23:59",
+            b"0001-01-01T00:00:00+00:00",
+            b"9999-12-31T23:59:59-23:59",
+            b"2025-07-16T00:30:00+05:30",
+        ];
+        let subs = b"0123456789-T:Z +/a\x00\xff";
+        for base in bases {
+            assert!(parse_ts(base).is_some());
+            assert_eq!(parse_ts(base), parse_ts_general(base));
+            for i in 0..25 {
+                for &c in subs {
+                    let mut v = *base;
+                    v[i] = c;
+                    assert_eq!(parse_ts(&v), parse_ts_general(&v), "{:?}", String::from_utf8_lossy(&v));
+                    for j in 0..25 {
+                        for &c2 in b"0129+-:" {
+                            let mut w = v;
+                            w[j] = c2;
+                            assert_eq!(parse_ts(&w), parse_ts_general(&w), "{:?}", String::from_utf8_lossy(&w));
+                        }
+                    }
+                }
+            }
+        }
+        // every offset hour and minute, around the limits
+        for oh in 0..=25 {
+            for om in [0, 1, 30, 58, 59, 60, 99] {
+                for sign in ['+', '-'] {
+                    let t = format!("2027-12-20T22:03:47{sign}{oh:02}:{om:02}");
+                    assert_eq!(parse_ts(t.as_bytes()), parse_ts_general(t.as_bytes()), "{t}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn f1_fast_equals_general() {
         let bases: [&[u8; 20]; 4] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"0001-01-01T00:00:00Z", b"9999-12-31T23:59:59Z"];

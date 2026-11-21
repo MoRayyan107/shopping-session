@@ -112,6 +112,36 @@ pub fn dedup_order(n: usize, idhash: impl Fn(usize) -> u64) -> Vec<u64> {
 /// An open-addressing table of (truncated hash, first row + 1) finds each row's group in one probe sequence;
 /// later rows of a group are only listed, so the table never holds two slots of one group.
 pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>) -> (Vec<bool>, Vec<Vec<usize>>) {
+    let mut g = Groups::default();
+    dedup_find_into(n, idhash, table, &mut g);
+    let groups = (0..g.len()).map(|i| g.group(i).iter().map(|&k| k as usize).collect()).collect();
+    (g.alone, groups)
+}
+
+/// The answer of `dedup_find` in reused buffers: `alone[i]`, and the groups as one flat list of rows.
+#[derive(Default)]
+pub struct Groups {
+    pub alone: Vec<bool>,
+    rows: Vec<u32>,
+    starts: Vec<u32>,
+    later: Vec<(u32, u32)>,
+}
+
+impl Groups {
+    pub fn len(&self) -> usize {
+        self.starts.len().saturating_sub(1)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Group i's rows (in row order until the caller reorders them).
+    pub fn group(&mut self, i: usize) -> &mut [u32] {
+        &mut self.rows[self.starts[i] as usize..self.starts[i + 1] as usize]
+    }
+}
+
+/// `dedup_find` into `g`, with no allocation once the buffers have grown.
+pub fn dedup_find_into(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>, g: &mut Groups) {
     assert!(n < (1 << IDX_BITS) - 1, "a dedup bucket holds {n} rows, more than 2^{IDX_BITS} - 2");
     let mask = (1u64 << IDX_BITS) - 1;
     let bits = ((2 * n).max(16)).next_power_of_two().trailing_zeros();
@@ -119,7 +149,8 @@ pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>)
     table.clear();
     table.resize(cap, 0);
     // (first row of the group, a later row) for every row whose truncated hash was seen before
-    let mut later: Vec<(u32, u32)> = Vec::new();
+    let later = &mut g.later;
+    later.clear();
     for i in 0..n {
         // the same 40 bits as dedup_order: below the bucket bits, above the index bits
         let h = (idhash(i) << PART_BITS) & !mask;
@@ -137,27 +168,28 @@ pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>)
             pos = (pos + 1) & (cap - 1);
         }
     }
-    let mut alone = vec![true; n];
+    g.alone.clear();
+    g.alone.resize(n, true);
+    g.rows.clear();
+    g.starts.clear();
     if later.is_empty() {
-        return (alone, Vec::new());
+        return;
     }
     // later rows are listed in row order, so a stable sort by first row keeps each group in row order
     later.sort_by_key(|p| p.0);
-    let mut groups = Vec::new();
     let mut a = 0;
     while a < later.len() {
         let first = later[a].0;
-        let mut g = vec![first as usize];
+        g.starts.push(g.rows.len() as u32);
+        g.rows.push(first);
+        g.alone[first as usize] = false;
         while a < later.len() && later[a].0 == first {
-            g.push(later[a].1 as usize);
+            g.rows.push(later[a].1);
+            g.alone[later[a].1 as usize] = false;
             a += 1;
         }
-        for &k in &g {
-            alone[k] = false;
-        }
-        groups.push(g);
     }
-    (alone, groups)
+    g.starts.push(g.rows.len() as u32);
 }
 
 /// From `order` (dedup_order of n rows): which rows are alone in their group, and the groups of 2 or more.
