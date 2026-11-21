@@ -262,7 +262,7 @@ fn main() {
                 let all = || ck.iter().flatten();
                 vec![
                     Col::OptStr(all().map(|c| Some(c.person.to_vec(&store))).collect()),
-                    Col::OptStr(all().map(|c| Some(store.get(c.click_id).to_vec())).collect()),
+                    Col::OptStr(all().map(|c| Some(c.click_id.to_vec(&store))).collect()),
                     Col::OptStr(all().map(|c| Some(camps.names[c.camp as usize].to_vec())).collect()),
                     Col::OptI64(all().map(|c| Some(c.ts)).collect()),
                 ]

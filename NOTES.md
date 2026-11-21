@@ -354,6 +354,30 @@ p60m cold 12g 9.6 s (base 9.0 s in the same batch; every stage, also untouched o
 self links, empty sides, long and short IDs mixed); all stage tables + outputs on 61 datasets and p20m; the
 same with `NATIVE_KEY_INLINE_MAX=4` (61/61); side store (41/41).
 
+### 4. Dedup without reading lines back: verified, committed
+
+- Events: the record keeps the event_id's exact key (not a hash) and ingest_ts in ms when it is an F1 string
+  (20 bytes, ends in `Z`). F1 strings are fixed width, most significant first, so their byte order is their
+  time order: when every copy of an id has an F1 ingest and the smallest is unique, that copy is the one the
+  oracle keeps (ingest_ts as a string first). Otherwise (another form, or a tie on ingest) the copies' lines
+  are split and ordered exactly as before. On dev every ingest is F1 and the 77 tied groups hold identical
+  rows; the fallback keeps exactness for any data.
+- Clicks: the record keeps the click_id's key; copies of one click_id whose parsed values (user, ts,
+  campaign + validity) agree resolve to any one of them (they produce the same click); otherwise the lines are
+  ordered as before. The click carries the key instead of a span, and the per-person order compares keys
+  (inline keys order as bytes; long keys are read back), so no `span_of` and no cold line read per click.
+- Cost: `Rec` 48 -> 64 B (events), click `Rec` 56 B, `Click` 40 -> 48 B: p60m anon peak 6.0 -> 7.3 GB.
+
+| p20m vs `7167548` (3 alternating runs, all 6 pairs faster) | `7167548` | this |
+| --- | --- | --- |
+| warm whole run / pipeline | 2.43-2.54 / 1.90-2.01 s | 2.28-2.38 / 1.79-1.85 s |
+| cold whole run / pipeline | 2.77-2.87 / 2.29-2.40 s | 2.62-2.87 / 2.14-2.36 s |
+| events dedup / clicks dedup stage | 0.51 / 0.31 s | 0.40 / 0.24 s |
+
+p60m cold: 12g 9.5 -> 8.4 s, 10g 14.7 -> 8.8 s (major faults 6.7k -> 1.2k: no lines re-read); both MATCH.
+Verified exact: 24 unit tests (F1 parsing and order, click_id key order = byte order); all stage tables +
+outputs on 61 datasets and p20m; the same with `NATIVE_KEY_INLINE_MAX=4` (61/61 and p20m); side store (41/41).
+
 ### Environment
 
 - `D:` is a USB drive (WD P40) that Windows powers off when idle ("USB selective suspend"); each time, Docker

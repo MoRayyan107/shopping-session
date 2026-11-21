@@ -16,7 +16,7 @@ use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
 use crate::ts::{parse_price, parse_ts};
-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
 
 pub const VIEW: u8 = 0;
 pub const CART: u8 = 1;
@@ -105,16 +105,31 @@ impl Event {
     }
 }
 
-/// One well-formed line with a non-empty event_id, validated (48 bytes). Type INVALID when the copy fails.
+/// One well-formed line with a non-empty event_id, validated (64 bytes). Type INVALID when the copy fails.
 #[derive(Clone, Copy)]
 pub struct Rec {
-    idhash: u64,
+    /// the event_id's exact key (its hash picks the dedup bucket)
+    id: Key,
     /// the user ID's exact key (the default key when the copy is invalid)
     user: Key,
     line: Span,
     ts: i64,
+    /// ingest_ts in ms when it is an F1 timestamp (canonical: F1 strings order exactly as their times), else
+    /// NO_INGEST, which sends the copies of this event_id to the exact line-by-line resolution
+    ingest: i64,
     price_kind: u32,
     cat: u32,
+}
+
+const NO_INGEST: i64 = i64::MAX;
+
+/// ingest_ts in ms when it is a valid F1 timestamp, else NO_INGEST.
+#[inline]
+fn f1_ms(s: Option<&[u8]>) -> i64 {
+    match s {
+        Some(s) if s.len() == 20 && s[19] == b'Z' => parse_ts(s).unwrap_or(NO_INGEST),
+        _ => NO_INGEST,
+    }
 }
 
 /// The oracle's dedup order within one event_id: ingest_ts (raw string), then the other columns, NULLs last.
@@ -129,9 +144,10 @@ fn copy_order(a: &Row<'_, 7>, b: &Row<'_, 7>) -> Ordering {
     Ordering::Equal
 }
 
-/// Validation and the late filter for one copy: (user, product, ts, price, kind).
+/// Validation and the late filter for one copy: (user, product, ts, price, kind). `ingest` is the line's
+/// `f1_ms` (any other valid form is parsed here).
 #[inline]
-fn validate<'a>(r: &Row<'a, 7>, ws: i64, we: i64) -> Option<(&'a [u8], &'a [u8], i64, u32, u8)> {
+fn validate<'a>(r: &Row<'a, 7>, ws: i64, we: i64, ingest: i64) -> Option<(&'a [u8], &'a [u8], i64, u32, u8)> {
     let user = r[1]?;
     let product = r[5]?;
     let ts = parse_ts(r[2]?)?;
@@ -145,7 +161,7 @@ fn validate<'a>(r: &Row<'a, 7>, ws: i64, we: i64) -> Option<(&'a [u8], &'a [u8],
         _ => return None,
     };
     let price = if kind == PURCHASE { parse_price(r[6]?)? as u32 } else { 0 };
-    let ingest = parse_ts(r[3]?)?;
+    let ingest = if ingest != NO_INGEST { ingest } else { parse_ts(r[3]?)? };
     if ingest - ts > LATE_MS {
         return None;
     }
@@ -176,31 +192,34 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
                     continue;
                 }
                 let Some(id) = f[0] else { continue };
-                let idhash = hash_bytes(id);
+                let id = store.key(file, id);
                 let line_sp = store.span(file, line);
-                let rec = match validate(&f, ws, we) {
+                let ingest = f1_ms(f[3]);
+                let rec = match validate(&f, ws, we, ingest) {
                     Some((user, product, ts, price, kind)) => Rec {
-                        idhash,
+                        id,
                         user: store.key(file, user),
                         line: line_sp,
                         ts,
+                        ingest,
                         price_kind: pack_pk(price, kind),
                         // only purchases need a category (top_category sums purchase prices); the dumps
                         // recompute it from the line (`Categories::of`)
                         cat: if kind == PURCHASE { cats.of(product) } else { 0 },
                     },
                     None => Rec {
-                        idhash,
+                        id,
                         user: Key::default(),
                         line: line_sp,
                         ts: 0,
+                        ingest,
                         price_kind: pack_pk(0, INVALID),
                         cat: 0,
                     },
                 };
                 recs.push(rec);
             }
-            sort_by_bucket(recs, |r| bucket(r.idhash))
+            sort_by_bucket(recs, |r| bucket(r.id.hash()))
         });
     prof("events: split + validate into blocks", &mut t);
     Buckets::new(blocks)
@@ -219,7 +238,7 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                 recs.clear();
                 events.clear();
                 by_id.gather(b, recs);
-                let order = dedup_order(recs.len(), |i| recs[i].idhash);
+                let order = dedup_order(recs.len(), |i| recs[i].id.hash());
                 let mut kept = 0usize;
                 let emit = |r: &Rec, events: &mut Vec<Event>| {
                     if (r.price_kind >> 24) as u8 != INVALID {
@@ -236,21 +255,37 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                     }
                 }
                 for grp in &groups {
-                    // copies of one id (or a hash collision): order by (id, the oracle's copy order)
-                    let mut g: Vec<(Row<'_, 7>, usize)> = grp
-                        .iter()
-                        .map(|&k| {
-                            let mut f = [None; 7];
-                            split_line(store.get(recs[k].line), &mut f);
-                            (f, k)
-                        })
-                        .collect();
-                    g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
-                    for (n, (row, k)) in g.iter().enumerate() {
-                        if n == 0 || g[n - 1].0[0] != row[0] {
-                            kept += 1;
-                            emit(&recs[*k], events);
+                    // a truncated-hash group: runs of one event_id (equal keys <=> equal IDs) by ingest_ts
+                    let mut g: Vec<usize> = grp.clone();
+                    g.sort_unstable_by_key(|&k| (recs[k].id, recs[k].ingest, k));
+                    let mut a = 0;
+                    while a < g.len() {
+                        let mut z = a + 1;
+                        while z < g.len() && recs[g[z]].id == recs[g[a]].id {
+                            z += 1;
                         }
+                        let run = &g[a..z];
+                        a = z;
+                        kept += 1;
+                        // the oracle keeps the first copy by (ingest_ts as a string, then the other columns):
+                        // when every copy's ingest_ts is F1 and the smallest is unique, that is run[0]
+                        let unique_first = run.iter().all(|&k| recs[k].ingest != NO_INGEST)
+                            && (run.len() == 1 || recs[run[0]].ingest != recs[run[1]].ingest);
+                        if unique_first {
+                            emit(&recs[run[0]], events);
+                            continue;
+                        }
+                        // otherwise the exact order from the lines themselves
+                        let first = run
+                            .iter()
+                            .map(|&k| {
+                                let mut f = [None; 7];
+                                split_line(store.get(recs[k].line), &mut f);
+                                (f, k)
+                            })
+                            .min_by(|x, y| copy_order(&x.0, &y.0).then(x.1.cmp(&y.1)))
+                            .unwrap();
+                        emit(&recs[first.1], events);
                     }
                 }
                 (kept, sort_by_bucket(events, |e| bucket(e.person.hash())))
@@ -270,8 +305,20 @@ mod tests {
     use super::*;
     #[test]
     fn record_sizes() {
-        assert_eq!(std::mem::size_of::<Rec>(), 48);
+        assert_eq!(std::mem::size_of::<Rec>(), 64);
         assert_eq!(std::mem::size_of::<Event>(), 40);
+    }
+    #[test]
+    fn f1_ingest_only() {
+        assert_eq!(f1_ms(Some(b"2026-10-03T23:58:10Z")), 1791071890000);
+        assert_eq!(f1_ms(Some(b"2026-10-03T19:58:10-04:00")), NO_INGEST);
+        assert_eq!(f1_ms(Some(b"1791071890000")), NO_INGEST);
+        assert_eq!(f1_ms(Some(b"2026-02-30T00:00:00Z")), NO_INGEST);
+        assert_eq!(f1_ms(None), NO_INGEST);
+        // F1 strings order exactly as their times (fixed width, most significant first)
+        let a: &[u8] = b"2026-10-03T23:58:10Z";
+        let b: &[u8] = b"2026-10-04T00:00:00Z";
+        assert_eq!(a.cmp(b), f1_ms(Some(a)).cmp(&f1_ms(Some(b))));
     }
     #[test]
     fn price_kind_packing() {
