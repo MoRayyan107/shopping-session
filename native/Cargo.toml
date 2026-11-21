@@ -1,0 +1,23 @@
+[package]
+name = "shopping-sessions-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench_parse"
+path = "src/bin/bench_parse.rs"
+
+[dependencies]
+memmap2 = "=0.9.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

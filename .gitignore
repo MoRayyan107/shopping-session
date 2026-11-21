@@ -28,3 +28,6 @@ Thumbs.db
 dev-answer/
 # organizers' dataset generator (built outside the repo; never commit its target/)
 generator/
+
+# native build output
+native/target/
