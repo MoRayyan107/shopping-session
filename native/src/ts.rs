@@ -81,20 +81,44 @@ fn parse_f2(s: &[u8; 25]) -> Option<i64> {
     Some(parse_f1(&f1)? - sign * (oh * 60 + om) * 60_000)
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` with every check of the general path, at fixed positions.
+/// The bad-byte test of one word: `e` is the word XOR its expected bytes (`0` in digit places, the separator
+/// itself elsewhere), `digits` has 0xFF in the digit places. A digit byte is good when its `e` is at most 9
+/// (exactly `0`-`9`), a separator byte when its `e` is 0. Nonzero iff some byte is bad: a byte's carry only
+/// reaches higher bytes, and only out of a bad byte, so the lowest bad byte is always seen and good bytes
+/// never set a flag.
+#[inline(always)]
+fn bad_bytes(e: u64, digits: u64) -> u64 {
+    let hi = digits & 0x8080_8080_8080_8080;
+    let k = digits & 0x7676_7676_7676_7676;
+    (e & !digits) | ((((e & digits) + k) | e) & hi)
+}
+
+/// Each byte k (k + 1 also a digit place) becomes 10 * digit k + digit k + 1; digits are at most 9, so no
+/// byte overflows.
+#[inline(always)]
+fn pairs(d: u64) -> u64 {
+    d * 10 + (d >> 8)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` with every check of the general path, at fixed positions, eight bytes at a time.
 #[inline(always)]
 fn parse_f1(s: &[u8; 20]) -> Option<i64> {
-    let d = |i: usize| s[i].wrapping_sub(b'0');
-    let mut bad = 0u8;
-    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
-        bad |= (d(i) > 9) as u8;
-    }
-    if bad != 0 || s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    const EA: u64 = u64::from_le_bytes(*b"0000-00-");
+    const EB: u64 = u64::from_le_bytes(*b"00T00:00");
+    const EC: u64 = u32::from_le_bytes(*b":00Z") as u64;
+    const DA: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const DB: u64 = 0xFFFF_00FF_FF00_FFFF;
+    const DC: u64 = 0x0000_0000_00FF_FF00;
+    let ea = u64::from_le_bytes(s[0..8].try_into().unwrap()) ^ EA;
+    let eb = u64::from_le_bytes(s[8..16].try_into().unwrap()) ^ EB;
+    let ec = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64 ^ EC;
+    if bad_bytes(ea, DA) | bad_bytes(eb, DB) | bad_bytes(ec, DC) != 0 {
         return None;
     }
-    let two = |i: usize| (d(i) as i64) * 10 + d(i + 1) as i64;
-    let (y, mo, dd) = (two(0) * 100 + two(2), two(5), two(8));
-    let (h, mi, se) = (two(11), two(14), two(17));
+    let (pa, pb, pc) = (pairs(ea & DA), pairs(eb & DB), pairs(ec & DC));
+    let byte = |w: u64, k: u32| ((w >> (8 * k)) & 0xFF) as i64;
+    let (y, mo, dd) = (byte(pa, 0) * 100 + byte(pa, 2), byte(pa, 5), byte(pb, 0));
+    let (h, mi, se) = (byte(pb, 3), byte(pb, 6), byte(pc, 1));
     if y < 1 || !(1..=12).contains(&mo) || dd < 1 || dd > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
         return None;
     }
@@ -240,6 +264,23 @@ mod tests {
                         for &c2 in b"019-:" {
                             let mut w = v;
                             w[j] = c2;
+                            assert_eq!(parse_ts(&w), parse_ts_general(&w), "{:?}", String::from_utf8_lossy(&w));
+                        }
+                    }
+                }
+            }
+        }
+        // every byte value at every position, alone and next to a bad byte below it (the SWAR carry case)
+        for base in bases {
+            for i in 0..20 {
+                for c in 0..=255u8 {
+                    let mut v = *base;
+                    v[i] = c;
+                    assert_eq!(parse_ts(&v), parse_ts_general(&v), "{:?}", String::from_utf8_lossy(&v));
+                    if i > 0 {
+                        for low in [0xFFu8, 0x8A, 0x39 + 1, b'/'] {
+                            let mut w = v;
+                            w[i - 1] = low;
                             assert_eq!(parse_ts(&w), parse_ts_general(&w), "{:?}", String::from_utf8_lossy(&w));
                         }
                     }
