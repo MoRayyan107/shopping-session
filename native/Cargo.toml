@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 publish = false
+resolver = "3"   # choose dependency versions that support rust-version
 
 [lib]
 path = "src/lib.rs"
@@ -12,8 +13,14 @@ path = "src/lib.rs"
 name = "bench_parse"
 path = "src/bin/bench_parse.rs"
 
+[[bin]]
+name = "parquet_probe"
+path = "src/bin/parquet_probe.rs"
+
 [dependencies]
 memmap2 = "=0.9.5"
+# Low-level column writer only: no arrow, no compression codecs. 59.3.3 is the newest that supports Rust 1.85.
+parquet = { version = "=59.3.3", default-features = false }
 
 [profile.release]
 opt-level = 3
