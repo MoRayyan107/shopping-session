@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::csv::{chunks, lines, map_dir, map_file, split_line};
+use crate::csv::{chunks, map_dir, map_file};
 
 /// The memory-mapped files of one input; rows borrow from these.
 pub struct Mapped {
@@ -135,12 +135,7 @@ pub fn parse<const N: usize>(m: &Mapped) -> Vec<Row<'_, N>> {
         .par_iter()
         .map(|piece| {
             let mut out = Vec::with_capacity(piece.len() / 64);
-            let mut f: Row<'_, N> = [None; N];
-            for line in lines(piece) {
-                if split_line(line, &mut f) {
-                    out.push(f);
-                }
-            }
+            crate::csv::for_each_row::<N, _>(piece, |_, f| out.push(*f));
             out
         })
         .collect();

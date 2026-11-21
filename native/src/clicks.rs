@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use rayon::prelude::*;
 
-use crate::csv::{lines, split_line};
+use crate::csv::{for_each_row, split_line};
 use crate::key::Key;
 use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
@@ -130,12 +130,8 @@ pub fn build<'a>(
     let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
             crate::raw::note_taken(piece.len());
             recs.clear();
-            let mut f: Row<'a, 4> = [None; 4];
-            for line in lines(piece) {
-                if !split_line(line, &mut f) {
-                    continue;
-                }
-                let Some(id) = f[0] else { continue };
+            for_each_row::<4, _>(piece, |line, f| {
+                let Some(id) = f[0] else { return };
                 let id = store.key(file, id);
                 let valid = || -> Option<(&'a [u8], u32, i64)> {
                     let user = f[1]?;
@@ -152,7 +148,7 @@ pub fn build<'a>(
                     None => Rec { id, user: Key::default(), line: line_sp, ts: 0, camp_valid: 0 },
                 };
                 recs.push(rec);
-            }
+            });
             sort_by_bucket(recs, |r| bucket(r.id.hash()))
         });
     let by_id = Buckets::new(blocks);

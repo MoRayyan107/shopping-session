@@ -51,6 +51,37 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// Epoch milliseconds (UTC) of a timestamp, or `None` when it is a bad timestamp.
 #[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
+    // F1 (all ingest_ts, most ts) at fixed positions; a 20-byte value ending in `Z` is never all digits, so
+    // this is the same answer as the general path below
+    if s.len() == 20 && s[19] == b'Z' {
+        return parse_f1(s.try_into().unwrap());
+    }
+    parse_ts_general(s)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` with every check of the general path, at fixed positions.
+#[inline(always)]
+fn parse_f1(s: &[u8; 20]) -> Option<i64> {
+    let d = |i: usize| s[i].wrapping_sub(b'0');
+    let mut bad = 0u8;
+    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        bad |= (d(i) > 9) as u8;
+    }
+    if bad != 0 || s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        return None;
+    }
+    let two = |i: usize| (d(i) as i64) * 10 + d(i + 1) as i64;
+    let (y, mo, dd) = (two(0) * 100 + two(2), two(5), two(8));
+    let (h, mi, se) = (two(11), two(14), two(17));
+    if y < 1 || !(1..=12).contains(&mo) || dd < 1 || dd > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    Some((days_from_civil(y, mo, dd) * 86400 + h * 3600 + mi * 60 + se) * 1000)
+}
+
+/// Every form, by the rules (the reference path; `parse_ts` takes F1 aside first).
+#[inline]
+pub fn parse_ts_general(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
@@ -130,5 +161,38 @@ mod tests {
         assert_eq!(parse_ts(b"1791071890000\r"), None);
         assert_eq!(parse_price(b"0250"), Some(250));
         assert_eq!(parse_price(b"10000001"), None);
+    }
+
+    /// The F1 fast path against the general path: every position mutated to digits, separators and others.
+    #[test]
+    fn f1_fast_equals_general() {
+        let bases: [&[u8; 20]; 4] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"0001-01-01T00:00:00Z", b"9999-12-31T23:59:59Z"];
+        let subs = b"0123456789-T:Z +/a\x00\xff";
+        for base in bases {
+            assert_eq!(parse_ts(base), parse_ts_general(base));
+            for i in 0..20 {
+                for &c in subs {
+                    let mut v = *base;
+                    v[i] = c;
+                    assert_eq!(parse_ts(&v), parse_ts_general(&v), "{:?}", String::from_utf8_lossy(&v));
+                    for j in 0..20 {
+                        for &c2 in b"019-:" {
+                            let mut w = v;
+                            w[j] = c2;
+                            assert_eq!(parse_ts(&w), parse_ts_general(&w), "{:?}", String::from_utf8_lossy(&w));
+                        }
+                    }
+                }
+            }
+        }
+        // every day of several years, including leap rules
+        for y in [1900i64, 2000, 2024, 2025, 2026, 2027, 2028, 2100] {
+            for mo in 1..=12 {
+                for dd in 0..=32 {
+                    let t = format!("{y:04}-{mo:02}-{dd:02}T12:34:56Z");
+                    assert_eq!(parse_ts(t.as_bytes()), parse_ts_general(t.as_bytes()), "{t}");
+                }
+            }
+        }
     }
 }

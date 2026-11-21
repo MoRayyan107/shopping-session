@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use rayon::prelude::*;
 
-use crate::csv::{lines, split_line};
+use crate::csv::{for_each_row, split_line};
 use crate::key::Key;
 use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
@@ -186,16 +186,12 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
     let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
             crate::raw::note_taken(piece.len());
             recs.clear();
-            let mut f: Row<'_, 7> = [None; 7];
-            for line in lines(piece) {
-                if !split_line(line, &mut f) {
-                    continue;
-                }
-                let Some(id) = f[0] else { continue };
+            for_each_row::<7, _>(piece, |line, f| {
+                let Some(id) = f[0] else { return };
                 let id = store.key(file, id);
                 let line_sp = store.span(file, line);
                 let ingest = f1_ms(f[3]);
-                let rec = match validate(&f, ws, we, ingest) {
+                let rec = match validate(f, ws, we, ingest) {
                     Some((user, product, ts, price, kind)) => Rec {
                         id,
                         user: store.key(file, user),
@@ -218,7 +214,7 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
                     },
                 };
                 recs.push(rec);
-            }
+            });
             sort_by_bucket(recs, |r| bucket(r.id.hash()))
         });
     prof("events: split + validate into blocks", &mut t);

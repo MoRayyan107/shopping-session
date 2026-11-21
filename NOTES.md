@@ -378,6 +378,40 @@ p60m cold: 12g 9.5 -> 8.4 s, 10g 14.7 -> 8.8 s (major faults 6.7k -> 1.2k: no li
 Verified exact: 24 unit tests (F1 parsing and order, click_id key order = byte order); all stage tables +
 outputs on 61 datasets and p20m; the same with `NATIVE_KEY_INLINE_MAX=4` (61/61 and p20m); side store (41/41).
 
+### Redesign (approved 2026-11-21): steps 1-6, AVX2 only, runtime detection + reference fallback
+
+Floor analysis first (in the report of 2026-11-21): 0.3 s on 8 vCPUs is ~100 ns of thread time per event
+for everything; we spent ~600 ns (13.1 CPU-s at p20m). It needs a warm page cache and a clock that leaves
+out container start (an empty container is 0.44 s here); neither can be tested from here. The local CPU
+(i7-13620H) has AVX2 but no AVX-512, so only AVX2 can be measured, which is the approved scope.
+
+### 5. Step 1: AVX2 row splitter + F1 fast path: verified, committed
+
+- The profile showed ~60% of the split in three byte-at-a-time loops: `
+`, `,` per field, `"` per field. (The
+  earlier SSE2 attempt failed because it sent every line with a quote, ~79% of them, to the slow path.)
+- `csv::for_each_row`: at each line start, 128 bytes give three bitmasks (newline, comma, quote; four 32-byte
+  AVX2 compares each). The line ends at the first newline, needs exactly N - 1 commas, and a field's quote
+  bits must be none or exactly its first and last byte (the dialect: bare, or wrapped whole). Lines of 128
+  bytes or more, the last 128 bytes of a piece, CPUs without AVX2 (`is_x86_feature_detected`, once) and
+  `NATIVE_SIMD=off` go through the reference (`lines` + `split_line`). Used by events, clicks and the
+  links/products/campaigns parse.
+- `ts::parse_ts`: F1 (20 bytes ending in `Z`) parsed at fixed positions with the same checks; everything else
+  the general path. A 20-byte value ending in `Z` is never all digits, so the answer is the same.
+
+| p20m vs `918544b` (3 alternating runs, all 6 pairs faster) | `918544b` | step 1 |
+| --- | --- | --- |
+| warm whole run / pipeline | 2.28-2.43 / 1.75-1.83 s | 2.00-2.03 / 1.51-1.55 s |
+| cold whole run / pipeline | 2.58-2.67 / 2.04-2.18 s | 2.39-2.49 / 1.88-1.97 s |
+| events split stage | 0.81 s | 0.57 s |
+
+p60m cold: 12g 9.5 s, 10g 8.5 s, both MATCH (`918544b`: 8.4 / 8.8 s in an earlier batch; 12g sits at the
+memory cap, 12.76 GB peak, and varies by batch). Exact: unit tests 25 (AVX2 rows = reference on 40k random
+pieces over awkward alphabets and every id length around the 128-byte window; F1 fast = general on every
+single and double byte mutation of four bases and every day of eight years); all stage tables + outputs on
+61 datasets and p20m; the same with `NATIVE_SIMD=off` (61/61 and p20m); `NATIVE_KEY_INLINE_MAX=4` (61/61);
+side store (41/41).
+
 **Fresh-clone proof of `918544b55430749be0b6499250c6e2830626e6f7` (2026-11-21): passed.** Clone from GitHub,
 checkout, clean tree, `--no-cache` build (`shopping-sessions:fresh-918544b`), 36/36 fixtures through
 `run_fixtures.py` + `scripts/docker_run.sh` (TMPDIR on the host, MSYS_NO_PATHCONV=1), dev MATCH (pipeline 0.61 s),
