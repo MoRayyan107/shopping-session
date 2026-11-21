@@ -178,29 +178,37 @@ unsafe fn rows_avx2<'a, const N: usize, F: FnMut(&'a [u8], &[Option<&'a [u8]>; N
             p = next;
             continue;
         }
-        let lm = (1u128 << l) - 1;
+        // the newline's bit, 1 << l, found without a variable shift
+        let nb = n & n.wrapping_neg();
+        let lm = nb - 1;
         let mut c = c & lm;
-        let q = q & lm;
+        // quote bits not yet claimed by a field (fields are taken left to right)
+        let mut q = q & lm;
         if c.count_ones() as usize != N - 1 {
             p = next;
             continue;
         }
+        // field k is line[a..b]: `sb` is the bit of its first byte (1 << a), `eb` the bit of the comma or newline
+        // that ends it (1 << b); both move field by field without variable shifts
         let mut a = 0usize;
+        let mut sb = 1u128;
         let mut ok = true;
         for (k, slot) in row.iter_mut().enumerate() {
-            let b = if k + 1 < N {
-                let b = c.trailing_zeros() as usize;
-                c &= c - 1;
-                b
+            let eb = if k + 1 < N {
+                let eb = c & c.wrapping_neg();
+                c ^= eb;
+                eb
             } else {
-                l
+                nb
             };
-            // the field is line[a..b]; its quote bits
-            let fm = ((1u128 << b) - 1) & !((1u128 << a) - 1);
-            let fq = q & fm;
+            let b = eb.trailing_zeros() as usize;
+            // the field's quote bits: every unclaimed quote below its end
+            let fq = q & (eb - 1);
+            q ^= fq;
             let (s, e) = if fq == 0 {
                 (a, b)
-            } else if b - a >= 2 && fq == (1u128 << a) | (1u128 << (b - 1)) {
+            } else if sb != eb >> 1 && fq == sb | (eb >> 1) {
+                // at least two bytes (first != last), quoted exactly at the first and the last
                 (a + 1, b - 1)
             } else {
                 ok = false;
@@ -208,6 +216,7 @@ unsafe fn rows_avx2<'a, const N: usize, F: FnMut(&'a [u8], &[Option<&'a [u8]>; N
             };
             *slot = if s == e { None } else { Some(&line[s..e]) };
             a = b + 1;
+            sb = eb << 1;
         }
         if ok {
             f(line, &row);
