@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use crate::csv::{for_each_row, split_line};
 use crate::key::Key;
-use crate::links::PersonTable;
+use crate::links::{PersonTable, PREFETCH_ROWS};
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
 use crate::ts::{parse_price, parse_ts};
@@ -240,10 +240,18 @@ pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built
                 };
                 dedup_find_into(recs.len(), |i| recs[i].id.hash(), table, groups);
                 // unique ids in memory order (sequential reads), then the groups of copies
-                for (i, r) in recs.iter().enumerate() {
+                // the person table is random access: its filter word is requested 2D rows ahead, its slot D
+                const D: usize = PREFETCH_ROWS;
+                for i in 0..recs.len() {
+                    if let Some(r) = recs.get(i + 2 * D) {
+                        ptab.prefetch_bits(r.user);
+                    }
+                    if let Some(r) = recs.get(i + D) {
+                        ptab.prefetch_slot(r.user);
+                    }
                     if groups.alone[i] {
                         *kept += 1;
-                        emit(r, events);
+                        emit(&recs[i], events);
                     }
                 }
                 for gi in 0..groups.len() {

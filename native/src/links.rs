@@ -49,6 +49,24 @@ impl PersonTable {
         PersonTable { mask: cap - 1, slots, bits, bit_mask: nbits - 1 }
     }
 
+    /// A hint only: start loading the bit-filter word `lookup(user)` reads first.
+    #[inline(always)]
+    pub fn prefetch_bits(&self, user: Key) {
+        let b = (user.hash() >> 32) as usize & self.bit_mask;
+        prefetch(&self.bits[b / 64]);
+    }
+
+    /// A hint only: when the filter says `user` may be renamed (its word should be loaded by now), start
+    /// loading the slot where `lookup(user)` starts probing.
+    #[inline(always)]
+    pub fn prefetch_slot(&self, user: Key) {
+        let hash = user.hash();
+        let b = (hash >> 32) as usize & self.bit_mask;
+        if self.bits[b / 64] & (1 << (b % 64)) != 0 {
+            prefetch(&self.slots[hash as usize & self.mask]);
+        }
+    }
+
     /// The person of a (non-empty) user ID.
     #[inline]
     pub fn lookup(&self, user: Key) -> Key {
@@ -70,6 +88,21 @@ impl PersonTable {
         }
     }
 }
+
+/// Ask the CPU to start loading the cache line of `x` (no effect on any value).
+#[inline(always)]
+pub fn prefetch<T>(x: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults and reads nothing the program sees; SSE is part of x86_64.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(x as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = x;
+}
+
+/// How many rows ahead the dedup loops prefetch the person table (the filter word at 2D, the slot at D).
+pub const PREFETCH_ROWS: usize = 8;
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
