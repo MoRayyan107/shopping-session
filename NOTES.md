@@ -378,6 +378,19 @@ p60m cold: 12g 9.5 -> 8.4 s, 10g 14.7 -> 8.8 s (major faults 6.7k -> 1.2k: no li
 Verified exact: 24 unit tests (F1 parsing and order, click_id key order = byte order); all stage tables +
 outputs on 61 datasets and p20m; the same with `NATIVE_KEY_INLINE_MAX=4` (61/61 and p20m); side store (41/41).
 
+**Fresh-clone proof of `918544b55430749be0b6499250c6e2830626e6f7` (2026-11-21): passed.** Clone from GitHub,
+checkout, clean tree, `--no-cache` build (`shopping-sessions:fresh-918544b`), 36/36 fixtures through
+`run_fixtures.py` + `scripts/docker_run.sh` (TMPDIR on the host, MSYS_NO_PATHCONV=1), dev MATCH (pipeline 0.61 s),
+p20m with the scorer's flags at 24g from `vol_p20m` (the host `data/p20m` folder is an empty placeholder):
+cold 2.68 s whole run / 2.13 s pipeline, warm 2.40 / 1.80 s, anon 2.3-2.5 GB, MATCH both.
+
+### Tried, not kept
+
+- SSE2 tokenizer (64-byte newline/comma/quote masks; lines without quotes cut at the mask positions, others
+  through `split_line`; equal to `lines` + `split_line` on 60k random pieces): split 0.82 -> 0.80 s, whole runs
+  4 of 6 pairs faster, 2 slower. Not measurably faster: the split is dominated by validation (timestamps,
+  keys, the record push), not by finding the commas. Patch kept outside the repo.
+
 ### Environment
 
 - `D:` is a USB drive (WD P40) that Windows powers off when idle ("USB selective suspend"); each time, Docker
