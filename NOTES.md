@@ -128,9 +128,10 @@ from the Docker volume `vol_p20m`.
 | 1 Parse | `raw_events`, `raw_clicks`, `links` | match on all 61 datasets and on `p20m` |
 | 2 Events dedup + validate + late | `ev_valid` | match on all 61 datasets and on `p20m` (19,649,172 rows) |
 | 3 Linked IDs (union-find, byte-wise smallest name) | `person_map` | match on all 61 datasets and on `p20m` (812,055 rows) |
+| 4 Person, sessions, day, category | `ev_sessioned`, `sessions` | match on all 61 datasets and on `p20m` (3,428,818 sessions) |
 
 Native timings at 20M (in Docker, 8 threads, dumps excluded): parse events 1.31 s, clicks 0.20 s, events
-dedup 0.92 s (hash-partitioned, 256 parts), validate + late 0.38-0.67 s, linked IDs 0.46 s (one thread). `NATIVE_DUMP_TABLES` limits which dumps are
+dedup 0.92 s (hash-partitioned, 256 parts), validate + late 0.38-0.67 s, linked IDs 0.46 s (one thread), sessions 2.02 s. `NATIVE_DUMP_TABLES` limits which dumps are
 written. To optimise once everything matches.
 
 ## Next

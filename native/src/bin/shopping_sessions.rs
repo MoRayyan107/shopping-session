@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
-use shopping_sessions_native::{events, links};
+use shopping_sessions_native::{events, links, sessions};
 use shopping_sessions_native::pq::Col;
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
@@ -105,6 +105,56 @@ fn main() {
             ],
         );
         clock.lap("dump stage 3", "person_map");
+    }
+
+    // Stage 4: person, sessions, day, category
+    let prod = sessions::product_map(&products);
+    let parts = sessions::sessionize(&ev, &pmap, &prod);
+    clock.lap("sessions", parts.iter().map(|p| p.sessions.len()).sum::<usize>());
+    if dump.on() {
+        let all_s = || parts.iter().flat_map(|p| p.sessions.iter());
+        // every event with its session (events of a session are contiguous)
+        let all_e = || {
+            parts.iter().flat_map(|p| {
+                p.sessions.iter().flat_map(move |s| {
+                    p.events[s.first as usize..(s.first + s.n_events) as usize].iter().map(move |e| (s, e))
+                })
+            })
+        };
+        dump.table(
+            "ev_sessioned",
+            "message ev_sessioned { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 ts_ms; OPTIONAL INT64 session_start; \
+             OPTIONAL INT32 day (DATE); OPTIONAL BYTE_ARRAY event_type (STRING); OPTIONAL BYTE_ARRAY product_id (STRING); \
+             OPTIONAL INT64 price_cents; OPTIONAL BYTE_ARRAY category (STRING); }",
+            || {
+                vec![
+                    Col::OptStr(all_e().map(|(_, e)| Some(e.person.to_vec())).collect()),
+                    Col::OptI64(all_e().map(|(_, e)| Some(e.ev.ts)).collect()),
+                    Col::OptI64(all_e().map(|(s, _)| Some(s.start)).collect()),
+                    Col::OptDate(all_e().map(|(s, _)| Some(s.day)).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(events::TYPE_NAMES[e.ev.kind as usize].to_vec())).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(e.ev.product.to_vec())).collect()),
+                    Col::OptI64(all_e().map(|(_, e)| (e.ev.kind == events::PURCHASE).then_some(e.ev.price)).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(e.category.to_vec())).collect()),
+                ]
+            },
+        );
+        dump.table(
+            "sessions",
+            "message sessions { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 session_start; OPTIONAL INT32 day (DATE); \
+             OPTIONAL INT64 n_events; OPTIONAL INT64 revenue_cents; OPTIONAL BOOLEAN has_purchase; }",
+            || {
+                vec![
+                    Col::OptStr(all_s().map(|s| Some(s.person.to_vec())).collect()),
+                    Col::OptI64(all_s().map(|s| Some(s.start)).collect()),
+                    Col::OptDate(all_s().map(|s| Some(s.day)).collect()),
+                    Col::OptI64(all_s().map(|s| Some(s.n_events as i64)).collect()),
+                    Col::OptI64(all_s().map(|s| Some(s.revenue)).collect()),
+                    Col::OptBool(all_s().map(|s| Some(s.has_purchase)).collect()),
+                ]
+            },
+        );
+        clock.lap("dump stage 4", "ev_sessioned, sessions");
     }
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());

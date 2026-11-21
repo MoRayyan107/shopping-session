@@ -19,6 +19,8 @@ pub enum Col {
     I64(Vec<i64>),
     OptI64(Vec<Option<i64>>),
     Bool(Vec<bool>),
+    OptDate(Vec<Option<i32>>),
+    OptBool(Vec<Option<bool>>),
 }
 
 impl Col {
@@ -30,6 +32,8 @@ impl Col {
             Col::I64(v) => v.len(),
             Col::OptI64(v) => v.len(),
             Col::Bool(v) => v.len(),
+            Col::OptDate(v) => v.len(),
+            Col::OptBool(v) => v.len(),
         }
     }
 }
@@ -74,6 +78,18 @@ pub fn write_table(path: &Path, message_type: &str, cols: &[Col]) -> Result<()> 
                 }
                 Col::Bool(v) => {
                     col.typed::<BoolType>().write_batch(&v[start..end], None, None)?;
+                }
+                Col::OptDate(v) => {
+                    let part = &v[start..end];
+                    let defs: Vec<i16> = part.iter().map(|s| s.is_some() as i16).collect();
+                    let vals: Vec<i32> = part.iter().flatten().copied().collect();
+                    col.typed::<Int32Type>().write_batch(&vals, Some(&defs), None)?;
+                }
+                Col::OptBool(v) => {
+                    let part = &v[start..end];
+                    let defs: Vec<i16> = part.iter().map(|s| s.is_some() as i16).collect();
+                    let vals: Vec<bool> = part.iter().flatten().copied().collect();
+                    col.typed::<BoolType>().write_batch(&vals, Some(&defs), None)?;
                 }
             }
             col.close()?;
