@@ -150,6 +150,34 @@ mod tests {
     }
 
     #[test]
+    fn bucket_sort_and_gather_keep_every_row_in_block_order() {
+        // three blocks of (bucket, row id); buckets at both ends of the range, one block empty
+        let blocks: Vec<Vec<(usize, u32)>> = vec![
+            vec![(255, 0), (0, 1), (7, 2), (0, 3), (255, 4)],
+            vec![],
+            vec![(7, 5), (0, 6), (128, 7)],
+        ];
+        let sorted: Vec<(Vec<(usize, u32)>, Vec<u32>)> = blocks.iter().map(|b| sort_by_bucket(b, |r| r.0)).collect();
+        for (s, start) in &sorted {
+            assert_eq!(start.len(), NPARTS + 1);
+            assert_eq!(*start.last().unwrap() as usize, s.len());
+            assert!(s.windows(2).all(|w| w[0].0 < w[1].0 || (w[0].0 == w[1].0 && w[0].1 < w[1].1)), "stable");
+        }
+        let bk = Buckets::new(sorted);
+        assert_eq!(bk.len(), 8);
+        let mut g = Vec::new();
+        bk.gather(0, &mut g);
+        assert_eq!(g.iter().map(|r| r.1).collect::<Vec<_>>(), vec![1, 3, 6]);
+        assert_eq!(bk.bucket_len(255), 2);
+        assert_eq!(bk.bucket_len(1), 0);
+        let vecs = bk.into_vecs();
+        assert_eq!(vecs.len(), NPARTS);
+        assert_eq!(vecs[7].iter().map(|r| r.1).collect::<Vec<_>>(), vec![2, 5]);
+        assert_eq!(vecs[128], vec![(128, 7)]);
+        assert_eq!(vecs.iter().map(Vec::len).sum::<usize>(), 8);
+    }
+
+    #[test]
     fn partition_keeps_every_index_once_in_order() {
         let n = 200_000;
         let parts = partition(n, |i| if i % 7 == 0 { None } else { Some(hash_bytes(&(i as u64).to_le_bytes())) });
@@ -158,6 +186,72 @@ mod tests {
         all.sort();
         assert_eq!(all, (0..n as u32).filter(|i| i % 7 != 0).collect::<Vec<_>>());
     }
+}
+
+pub const NPARTS: usize = 1 << PART_BITS;
+
+/// Rows of many blocks, each block ordered by bucket (0..NPARTS) with the start of every bucket, so bucket
+/// b is the run of slices blocks[k][start[b]..start[b+1]] in block order. Nothing is copied to build it.
+pub struct Buckets<T> {
+    blocks: Vec<(Vec<T>, Vec<u32>)>,
+}
+
+impl<T: Copy + Send + Sync> Buckets<T> {
+    pub fn new(blocks: Vec<(Vec<T>, Vec<u32>)>) -> Buckets<T> {
+        Buckets { blocks }
+    }
+    pub fn len(&self) -> usize {
+        self.blocks.iter().map(|b| b.0.len()).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn bucket_len(&self, b: usize) -> usize {
+        self.blocks.iter().map(|(_, s)| (s[b + 1] - s[b]) as usize).sum()
+    }
+    /// Bucket b appended to `out`, in block order.
+    pub fn gather(&self, b: usize, out: &mut Vec<T>) {
+        out.reserve(self.bucket_len(b));
+        for (v, s) in &self.blocks {
+            out.extend_from_slice(&v[s[b] as usize..s[b + 1] as usize]);
+        }
+    }
+    /// Every bucket as one Vec (exact size), in parallel; the blocks are freed afterwards.
+    pub fn into_vecs(self) -> Vec<Vec<T>> {
+        let out = (0..NPARTS)
+            .into_par_iter()
+            .map(|b| {
+                let mut v = Vec::new();
+                self.gather(b, &mut v);
+                v
+            })
+            .collect();
+        drop(self);
+        out
+    }
+}
+
+/// Stable counting sort of `v` by bucket (0..NPARTS): the rows in bucket order and each bucket's start.
+pub fn sort_by_bucket<T: Copy>(v: &[T], bucket: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
+    let mut start = vec![0u32; NPARTS + 1];
+    if v.is_empty() {
+        return (Vec::new(), start);
+    }
+    assert!(v.len() < u32::MAX as usize, "a block holds {} rows", v.len());
+    let ids: Vec<u8> = v.iter().map(|x| bucket(x) as u8).collect();
+    for &b in &ids {
+        start[b as usize + 1] += 1;
+    }
+    for i in 0..NPARTS {
+        start[i + 1] += start[i];
+    }
+    let mut pos = start.clone();
+    let mut out = vec![v[0]; v.len()];
+    for (x, &b) in v.iter().zip(&ids) {
+        out[pos[b as usize] as usize] = *x;
+        pos[b as usize] += 1;
+    }
+    (out, start)
 }
 
 /// blocks[b][p] -> out[p] = blocks[0][p] ++ blocks[1][p] ++ ... (parallel over p)

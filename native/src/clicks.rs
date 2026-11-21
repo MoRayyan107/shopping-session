@@ -6,10 +6,11 @@ use rayon::prelude::*;
 
 use crate::csv::{lines, split_line};
 use crate::links::PersonTable;
-use crate::raw::{pieces, Mapped, Row};
-use crate::sessions::{group_by_person, Part};
+use crate::raw::{pieces_with_file, Mapped, Row};
+use crate::sessions::{cmp_person, group_by_person, same_person, Part};
+use crate::span::{Span, Store};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, transpose_concat, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, sort_by_bucket, Buckets, FxMap, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -48,13 +49,14 @@ impl<'a> Campaigns<'a> {
     }
 }
 
+/// One valid click, mapped to its person (40 bytes).
 #[derive(Clone, Copy)]
-pub struct Click<'a> {
-    pub person: &'a [u8],
+pub struct Click {
+    pub person: Span,
     pub phash: u64,
-    pub click_id: &'a [u8],
-    pub camp: u32,
+    pub click_id: Span,
     pub ts: i64,
+    pub camp: u32,
 }
 
 /// Per session part: the credited campaign of every session (the organic id when none) and the assists.
@@ -66,17 +68,48 @@ pub struct Credit {
     pub assist_counts: FxMap<u64, i64>,
 }
 
-/// One well-formed line with a non-empty click_id, validated.
+/// click_id is field 0, so it starts the line (after a quote when quoted): `id_meta` holds its length and
+/// a quoted flag; RESPLIT (a length that does not fit) means "split the line again".
+const QUOTED: u32 = 1 << 31;
+const RESPLIT: u32 = u32::MAX;
+const VALID: u32 = 1 << 31;
+
+/// One well-formed line with a non-empty click_id, validated (48 bytes).
 #[derive(Clone, Copy)]
-struct Rec<'a> {
+pub struct Rec {
     idhash: u64,
     uhash: u64,
-    id: &'a [u8],
-    user: &'a [u8],
-    line: &'a [u8],
+    line: Span,
+    user: Span,
     ts: i64,
-    camp: u32,
-    valid: bool,
+    /// campaign id in the low 31 bits, VALID in the top bit
+    camp_valid: u32,
+    id_meta: u32,
+}
+
+impl Rec {
+    #[inline]
+    fn id<'a>(&self, store: &Store<'a>) -> &'a [u8] {
+        let line = store.get(self.line);
+        if self.id_meta == RESPLIT {
+            let mut f = [None; 4];
+            split_line(line, &mut f);
+            return f[0].unwrap();
+        }
+        let len = (self.id_meta & !QUOTED) as usize;
+        let at = (self.id_meta & QUOTED != 0) as usize;
+        &line[at..at + len]
+    }
+}
+
+#[inline]
+fn id_meta(line: &[u8], id: &[u8]) -> u32 {
+    let at = id.as_ptr() as usize - line.as_ptr() as usize;
+    if id.len() < QUOTED as usize - 1 {
+        id.len() as u32 | if at == 1 { QUOTED } else { 0 }
+    } else {
+        RESPLIT
+    }
 }
 
 #[inline]
@@ -98,14 +131,23 @@ fn copy_order(a: &Row<'_, 4>, b: &Row<'_, 4>) -> Ordering {
 /// Validation runs in the parse pass (it depends only on the copy); copies are resolved like the oracle.
 /// Returned bucketed by hash(person) exactly like the events (same hash, same bits), each bucket grouped
 /// by person and sorted by (ts, click_id).
-pub fn build<'a>(files: &'a Mapped, ptab: &PersonTable<'a>, camps: &Campaigns<'a>, ws: i64, we: i64) -> Vec<Vec<Click<'a>>> {
+pub fn build<'a>(
+    files: &'a Mapped,
+    first: u32,
+    store: &Store<'a>,
+    ptab: &PersonTable,
+    camps: &Campaigns<'_>,
+    ws: i64,
+    we: i64,
+) -> Vec<Vec<Click>> {
     let nparts = 1usize << PART_BITS;
     let bucket = |h: u64| (h >> (64 - PART_BITS)) as usize;
-    // pass 1: split + validate every line into click_id-hash buckets
-    let blocks: Vec<Vec<Vec<Rec<'a>>>> = pieces(files)
+    assert!(camps.names.len() < VALID as usize, "too many campaigns");
+    // pass 1: split + validate every line; each piece's records ordered by click_id-hash bucket
+    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = pieces_with_file(files, first)
         .par_iter()
-        .map(|piece| {
-            let mut out: Vec<Vec<Rec<'a>>> = (0..nparts).map(|_| Vec::with_capacity(piece.len() / 60 / nparts * 2)).collect();
+        .map_init(Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+            recs.clear();
             let mut f: Row<'a, 4> = [None; 4];
             for line in lines(piece) {
                 if !split_line(line, &mut f) {
@@ -113,6 +155,7 @@ pub fn build<'a>(files: &'a Mapped, ptab: &PersonTable<'a>, camps: &Campaigns<'a
                 }
                 let Some(id) = f[0] else { continue };
                 let idhash = hash_bytes(id);
+                let meta = id_meta(line, id);
                 let valid = || -> Option<(&'a [u8], u32, i64)> {
                     let user = f[1]?;
                     let camp = *camps.idx.get(f[2]?)?;
@@ -122,64 +165,81 @@ pub fn build<'a>(files: &'a Mapped, ptab: &PersonTable<'a>, camps: &Campaigns<'a
                     }
                     Some((user, camp, ts))
                 };
+                let line_sp = store.span(file, line);
                 let rec = match valid() {
-                    Some((user, camp, ts)) => Rec { idhash, uhash: hash_bytes(user), id, user, line, ts, camp, valid: true },
-                    None => Rec { idhash, uhash: 0, id, user: &[], line, ts: 0, camp: 0, valid: false },
+                    Some((user, camp, ts)) => Rec {
+                        idhash,
+                        uhash: hash_bytes(user),
+                        line: line_sp,
+                        user: store.span(file, user),
+                        ts,
+                        camp_valid: camp | VALID,
+                        id_meta: meta,
+                    },
+                    None => Rec { idhash, uhash: 0, line: line_sp, user: Span::EMPTY, ts: 0, camp_valid: 0, id_meta: meta },
                 };
-                out[bucket(idhash)].push(rec);
+                recs.push(rec);
             }
-            out
+            sort_by_bucket(recs, |r| bucket(r.idhash))
         })
         .collect();
-    let by_id = transpose_concat(blocks);
+    let by_id = Buckets::new(blocks);
     // pass 2: dedup each id bucket; kept valid clicks go to person buckets
-    let out: Vec<Vec<Vec<Click<'a>>>> = by_id
+    let out: Vec<(Vec<Click>, Vec<u32>)> = (0..nparts)
         .into_par_iter()
-        .map(|recs| {
-            let order = dedup_order(recs.len(), |i| recs[i].idhash);
-            let mut buckets: Vec<Vec<Click<'a>>> =
-                (0..nparts).map(|_| Vec::with_capacity(recs.len() / nparts + 16)).collect();
-            let emit = |r: &Rec<'a>, buckets: &mut Vec<Vec<Click<'a>>>| {
-                if r.valid {
-                    let (person, phash) = ptab.lookup(r.uhash, r.user);
-                    buckets[bucket(phash)].push(Click { person, phash, click_id: r.id, camp: r.camp, ts: r.ts });
-                }
-            };
-            let (alone, groups) = dedup_groups(&order);
-            // unique ids in memory order (sequential reads), then the groups of copies
-            for (i, r) in recs.iter().enumerate() {
-                if alone[i] {
-                    emit(r, &mut buckets);
-                }
-            }
-            for grp in &groups {
-                // copies of one id (or a hash collision): order by (id, the oracle's copy order)
-                let mut g: Vec<(Row<'a, 4>, usize)> = grp
-                    .iter()
-                    .map(|&k| {
-                        let mut f = [None; 4];
-                        split_line(recs[k].line, &mut f);
-                        (f, k)
-                    })
-                    .collect();
-                g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
-                for (n, (row, k)) in g.iter().enumerate() {
-                    if n == 0 || g[n - 1].0[0] != row[0] {
-                        emit(&recs[*k], &mut buckets);
+        .map_init(
+            || (Vec::new(), Vec::new()),
+            |(recs, clicks): &mut (Vec<Rec>, Vec<Click>), b| {
+                recs.clear();
+                clicks.clear();
+                by_id.gather(b, recs);
+                let order = dedup_order(recs.len(), |i| recs[i].idhash);
+                let emit = |r: &Rec, clicks: &mut Vec<Click>| {
+                    if r.camp_valid & VALID != 0 {
+                        let (person, phash) = ptab.lookup(r.uhash, r.user, store);
+                        let click_id = store.span_of(r.id(store));
+                        clicks.push(Click { person, phash, click_id, camp: r.camp_valid & !VALID, ts: r.ts });
+                    }
+                };
+                let (alone, groups) = dedup_groups(&order);
+                // unique ids in memory order (sequential reads), then the groups of copies
+                for (i, r) in recs.iter().enumerate() {
+                    if alone[i] {
+                        emit(r, clicks);
                     }
                 }
-            }
-            buckets
-        })
+                for grp in &groups {
+                    // copies of one id (or a hash collision): order by (id, the oracle's copy order)
+                    let mut g: Vec<(Row<'_, 4>, usize)> = grp
+                        .iter()
+                        .map(|&k| {
+                            let mut f = [None; 4];
+                            split_line(store.get(recs[k].line), &mut f);
+                            (f, k)
+                        })
+                        .collect();
+                    g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
+                    for (n, (row, k)) in g.iter().enumerate() {
+                        if n == 0 || g[n - 1].0[0] != row[0] {
+                            emit(&recs[*k], clicks);
+                        }
+                    }
+                }
+                sort_by_bucket(clicks, |c| bucket(c.phash))
+            },
+        )
         .collect();
-    let mut by_person = transpose_concat(out);
-    by_person.par_iter_mut().for_each(|v| group_by_person(v, |c| (c.phash, c.person, c.ts, c.click_id)));
+    drop(by_id);
+    let mut by_person = Buckets::new(out).into_vecs();
+    by_person
+        .par_iter_mut()
+        .for_each(|v| group_by_person(store, v, |c| (c.phash, c.person, c.ts, store.get(c.click_id))));
     by_person
 }
 
 /// Credit and assists for every session, part by part. Sessions and clicks of a part are both ordered by
 /// (person hash, person), so one forward walk finds each person's clicks.
-pub fn credit(parts: &[Part<'_>], clicks: &[Vec<Click<'_>>], camps: &Campaigns<'_>, keep_assists: bool) -> Vec<Credit> {
+pub fn credit(store: &Store<'_>, parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, keep_assists: bool) -> Vec<Credit> {
     assert_eq!(clicks.len(), parts.len());
     let ncamp = camps.names.len();
     parts
@@ -194,16 +254,17 @@ pub fn credit(parts: &[Part<'_>], clicks: &[Vec<Click<'_>>], camps: &Campaigns<'
             // stamp[c] == session number + 1 when campaign c already assists the current session
             let mut stamp = vec![0u32; ncamp];
             let mut j = 0usize; // first click not yet passed
-            let mut pc: &[Click<'_>] = &[];
-            let mut cur: Option<(u64, &[u8])> = None;
+            let mut pc: &[Click] = &[];
+            let mut cur: Option<(u64, Span)> = None;
             for (si, s) in p.sessions.iter().enumerate() {
-                if cur != Some((s.phash, s.person)) {
-                    cur = Some((s.phash, s.person));
-                    while j < ck.len() && (ck[j].phash, ck[j].person) < (s.phash, s.person) {
+                let sp = (s.phash, s.person);
+                if cur.is_none_or(|c| !same_person(store, c, sp)) {
+                    cur = Some(sp);
+                    while j < ck.len() && cmp_person(store, (ck[j].phash, ck[j].person), sp) == Ordering::Less {
                         j += 1;
                     }
                     let mut e = j;
-                    while e < ck.len() && ck[e].phash == s.phash && ck[e].person == s.person {
+                    while e < ck.len() && same_person(store, (ck[e].phash, ck[e].person), sp) {
                         e += 1;
                     }
                     pc = &ck[j..e];
@@ -235,4 +296,32 @@ pub fn credit(parts: &[Part<'_>], clicks: &[Vec<Click<'_>>], camps: &Campaigns<'
             out
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn record_sizes() {
+        assert_eq!(std::mem::size_of::<Rec>(), 48);
+        assert_eq!(std::mem::size_of::<Click>(), 40);
+    }
+    #[test]
+    fn click_id_from_the_line() {
+        let d = b"c1,u,x,1\n\"c22\",u,x,1\n".to_vec();
+        let store = Store::from_slices(vec![&d], crate::span::MAX_LEN);
+        let (l1, l2) = (&d[0..8], &d[9..20]);
+        let mk = |line: &[u8], id: &[u8], meta: Option<u32>| Rec {
+            idhash: 0,
+            uhash: 0,
+            line: store.span_of(&d[line.as_ptr() as usize - d.as_ptr() as usize..][..line.len()]),
+            user: Span::EMPTY,
+            ts: 0,
+            camp_valid: 0,
+            id_meta: meta.unwrap_or_else(|| id_meta(line, id)),
+        };
+        assert_eq!(mk(l1, &l1[0..2], None).id(&store), b"c1");
+        assert_eq!(mk(l2, &l2[1..4], None).id(&store), b"c22");
+        assert_eq!(mk(l2, &l2[1..4], Some(RESPLIT)).id(&store), b"c22");
+    }
 }

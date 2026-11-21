@@ -165,6 +165,83 @@ network, caps dropped, uid 1000, 8 CPUs; memory 12g because Docker Desktop here 
 - Data bind-mounted from the Windows host is slow on first read here (big3x: 10 s for 288 MB, then 1.4 s):
   Docker Desktop file sharing, not the pipeline. The scorer's disk will behave differently.
 
+**Fresh-clone proof of `597cf7d` (2026-11-21): passed.** `git clone` from GitHub, checkout `597cf7d`, clean tree,
+624 KB without `.git`; `docker buildx build --no-cache` 33 s; `run_fixtures.py fixtures -- sh scripts/docker_run.sh`
+36/36; dev through `docker_run.sh` + `compare.py` against `dev-answer`: MATCH; p20m (`tests/scorer_run.sh`,
+12g) + `compare.py` against `../data/oracle/p20m`: MATCH, exit 0. p20m cold: pipeline 4.25 s, wall 4.8 s; warm:
+2.89 / 2.96 s, wall 3.44 s; program's own memory (anon) peak 4.2 GB.
+
+**Running things on this machine (lessons):** the venv (Python 3.14, duckdb 1.5.6, polars 2.1.0) is
+`C:/Users/MOHAMM~1/AppData/Local/Temp/claude/b72337224c9975d8/c98ad2ac-1c23-4bc4-af14-730a65c1af9b/scratchpad/venv/Scripts/python.exe`
+(a temp folder: if it disappears, recreate it with `py -3.14 -m venv` + `pip install duckdb==1.5.6 polars`).
+`TMPDIR` for `docker_run.sh` must be a folder outside Windows' Temp, e.g. `/d/Hackathon/JoinBuilders/dockertmp`:
+Git Bash mounts Temp as `/tmp`, which Docker reads as a path in its own VM (root-owned, uid 1000 cannot write;
+the run dies with "create output folder: Permission denied", reported as exit 139 because of panic=abort).
+`tests/scorer_run.sh IMAGE VOLUME NAME [MEM]` is the record-keeping run for big datasets: scorer flags, no `--rm`,
+output volume, exit code, wall time, anon peak sampled every 0.2 s, `memory.peak`, major faults, OOM events,
+outputs copied to `../dockertmp/NAME/out`. Page cache is charged to the container that first read the file,
+so `memory.peak` includes the input only on a cold run.
+
+**p60m probe of `597cf7d` (2026-11-21, 15 GiB container): fails the final.** Split + validate 6.4 s,
+dedup + person 27.6 s (0.5 s at 20M), then stuck in sessions; the container exited after 624 s (no OOM event;
+the binary's own exit code and its outputs were lost: `--rm`, no output volume). At the sessions stage: anon
+12.2 GB, page cache 3.4 GB, `memory.peak` 15.9 GB, 9.7M major page faults, 47.7 GB read from disk. Cause:
+the program's own memory leaves too little room for the 5.6 GB of memory-mapped input, which later stages
+read at random (person IDs are slices into the files), so pages are evicted and re-read over and over.
+**glibc malloc settings on `597cf7d`** (environment only, `tests/scorer_run.sh`, 12g):
+
+| Setting | p20m pipeline | p20m anon peak / memory.peak | p60m |
+| ------- | ------------- | ----------------------------- | ---- |
+| none | 2.65 / 2.73 s | 4.13 / 4.25 GB | still in dedup at 200 s (stopped), anon 11.1 GB |
+| `MALLOC_ARENA_MAX=2` | 3.28 / 3.17 s (slower) | 4.11 / 4.22 GB | not run |
+| arena max 2 + fixed mmap/trim thresholds 128 KB | 3.40 / 3.08 s | 3.5-3.6 / 3.77 GB | not run |
+| `MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072` | 2.62 / 2.85 s | 3.05-3.75 / 3.77 GB | dedup 4.3 s (was 27.6 s), then stuck in sessions at 300 s (stopped), anon 10.2 GB, 249k major faults |
+
+Useful but not enough: the record layout itself has to shrink. To be re-measured on top of the new layout and
+kept only if it still helps.
+
+The unverified 8-byte line splitter is set aside as `git stash` "8-byte splitter (unverified)" (also
+`../dockertmp/splitter_8byte.patch`).
+
+### Lower-memory layout (branch `memory`)
+
+- `span.rs`: every string is an 8-byte `Span` (10 bits file, 34 bits offset, 20 bits length) into the mapped
+  files. Over any limit (file index >= 1023, offset >= 16 GB, length >= 1 MB) the slice goes to a side store
+  and the span holds its index, so every value resolves exactly. `NATIVE_SPAN_MAX_LEN=N` lowers the length
+  limit to test the side store end to end.
+- Records (checked by unit tests): event line 48 B (was 72), valid event 40 B (64), click line 48 B (80),
+  valid click 40 B (56), session 48 B (56), person-table slot 32 B (40).
+- No double copies: each ~4 MB piece writes its records into one array, then counting-sorts it by bucket
+  (`util::sort_by_bucket`); a bucket is the run of slices over the pieces (`util::Buckets`), gathered into a
+  per-thread scratch for dedup. Dedup output is sorted by person bucket per id bucket, the records are
+  freed, then the person buckets are gathered once. The planned `unsafe` scatter was not needed: it gives
+  the same peak (records + events are alive together either way), so there is no `unsafe` scatter.
+- Freed once used: links rows after the person map, event records after dedup, events after `user_daily`,
+  click records after the clicks are built, clicks after credit.
+
+Verified exact: unit tests (span limits incl. 1,100 files and a value of MAX_LEN + 1 bytes, record sizes,
+equal bytes with different spans, forced hash collisions); `tests/native_check.py` every stage table + both
+outputs on all 61 datasets and on p20m; the same with `NATIVE_SPAN_MAX_LEN=4` on the 36 fixtures, dev and 4
+small seeds (41/41; dev puts 2.96M values in the side store); p60m final outputs against the oracle.
+
+**Final numbers (memory commit, no mallopt, `tests/scorer_run.sh`):** p60m 12g exit 0, pipeline 12.1 s, wall
+12.9 s, anon peak 6.01 GB, `memory.peak` 10.94 GB (4.89 GB input cache), MATCH; p60m 10g exit 0, 8.8 s, anon
+5.86 GB, MATCH (warm: the input cache was charged to the 12g run, so this is weaker evidence than a cold 10g
+run). p20m: cold 3.70 s, warm 2.53 / 2.45 s (wall 2.98 / 2.86 s), anon 1.9 GB (`597cf7d`: 2.70-2.96 s, 4.2 GB).
+Re-verified on this exact code: 17 unit tests, all 61 datasets and p20m on every stage table + outputs, the
+side-store check (41/41).
+
+Earlier, with mallopt: p60m 12g exit 0, pipeline 13.1 s, anon peak 5.68 GB, `memory.peak`
+10.67 GB (4.9 GB of it input cache), MATCH. 10g exit 0, 10.8 s, MATCH. **8g does not finish** (stopped at
+400 s, 340k major faults): anon ~4.3 GB plus ~4.5 GB of input pages do not fit in 8 GiB, and dedup and sessions
+read IDs from the input at random. The threshold is between 8 and 10 GiB; the scorer has 24 GB.
+
+**mallopt: dropped** (removed from the code). Fixed 128 KB mmap/trim thresholds cost ~0.35 s at p20m on the new
+layout (2.83-2.92 s with, 2.51-2.55 s without; `597cf7d` 2.70-2.77 s) and at p60m 12g gave 13.1 s with against
+9.3 / 11.8 s without, for 0.2 GB less anon (5.68 vs 5.86 GB). The smaller layout is what fixed p60m.
+
+Practice score of `597cf7d` on the scorer: 4.09 s, correct (leaders 0.75-0.94 s).
+
 Optimisation history at 20M (in Docker, tmpfs output): first exact run 14.1 s; campaigns interned (credit +
 assists 5.2 -> 0.5 s) 12.4 s; validate while parsing, id buckets then person buckets, person-hash sorting
 3.2 s; parallel part files 2.8 s; packed-key dedup and the person bit filter 2.45 s.

@@ -10,4 +10,5 @@ pub mod util;
 pub mod pq;
 pub mod raw;
 pub mod sessions;
+pub mod span;
 pub mod ts;

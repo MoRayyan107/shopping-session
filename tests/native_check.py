@@ -40,8 +40,8 @@ def expand(names):
     return out
 
 
-def run_native(names, work, ncpu, tables):
-    script = [f"export NATIVE_PROFILE=1 NATIVE_DUMP_TABLES={','.join(tables) or 'none'}"]
+def run_native(names, work, ncpu, tables, env=()):
+    script = [f"export NATIVE_PROFILE=1 NATIVE_DUMP_TABLES={','.join(tables) or 'none'} {' '.join(env)}"]
     for n in names:
         src = f"/fx/{n[3:]}/input" if n.startswith("fx/") else f"/data/{n}"
         safe = n.replace("/", "__")
@@ -86,13 +86,14 @@ def main():
     ap.add_argument("--outputs", action="store_true")
     ap.add_argument("--ncpu", default="8")
     ap.add_argument("--keep", help="keep the native outputs and dumps in this folder")
+    ap.add_argument("--env", action="append", default=[], help="K=V for the native run, e.g. NATIVE_SPAN_MAX_LEN=4")
     ap.add_argument("names", nargs="+")
     a = ap.parse_args()
     names = expand(a.names)
     tables = [t for t in a.tables.split(",") if t]
     work = Path(a.keep) if a.keep else Path(tempfile.mkdtemp(prefix="native_check_"))
     work.mkdir(parents=True, exist_ok=True)
-    run_native(names, work, a.ncpu, tables)
+    run_native(names, work, a.ncpu, tables, a.env)
     con = duckdb.connect()
     bad = 0
     for n in names:

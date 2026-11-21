@@ -4,11 +4,12 @@ use rayon::prelude::*;
 use crate::clicks::{key, Campaigns, Credit};
 use crate::events::{Categories, PURCHASE};
 use crate::pq::{write_table, Col, USER_DAILY};
-use crate::sessions::Part;
+use crate::sessions::{same_person, Part};
+use crate::span::{Span, Store};
 use crate::util::FxMap;
 
 pub struct UserDay<'a> {
-    pub user: &'a [u8],
+    pub user: Span,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -17,7 +18,7 @@ pub struct UserDay<'a> {
 }
 
 /// One row per (person, day of session start).
-pub fn user_daily<'a>(parts: &[Part<'a>], cats: &Categories<'a>) -> Vec<Vec<UserDay<'a>>> {
+pub fn user_daily<'a>(store: &Store<'_>, parts: &[Part], cats: &Categories<'a>) -> Vec<Vec<UserDay<'a>>> {
     parts
         .par_iter()
         .map(|p| {
@@ -26,20 +27,20 @@ pub fn user_daily<'a>(parts: &[Part<'a>], cats: &Categories<'a>) -> Vec<Vec<User
             let ss = &p.sessions;
             let mut i = 0;
             while i < ss.len() {
-                let (person, day) = (ss[i].person, ss[i].day);
-                let mut row = UserDay { user: person, day, sessions: 0, events: 0, revenue: 0, top: None };
+                let (person, day) = ((ss[i].phash, ss[i].person), ss[i].day);
+                let mut row = UserDay { user: person.1, day, sessions: 0, events: 0, revenue: 0, top: None };
                 amounts.clear();
-                while i < ss.len() && ss[i].person == person && ss[i].day == day {
+                while i < ss.len() && ss[i].day == day && same_person(store, (ss[i].phash, ss[i].person), person) {
                     let s = &ss[i];
                     row.sessions += 1;
                     row.events += s.n_events as i64;
                     row.revenue += s.revenue;
                     if s.has_purchase {
                         for e in &p.events[s.first as usize..(s.first + s.n_events) as usize] {
-                            if e.kind == PURCHASE {
+                            if e.kind() == PURCHASE {
                                 match amounts.iter_mut().find(|c| c.0 == e.cat) {
-                                    Some(c) => c.1 += e.price as i64,
-                                    None => amounts.push((e.cat, e.price as i64)),
+                                    Some(c) => c.1 += e.price() as i64,
+                                    None => amounts.push((e.cat, e.price() as i64)),
                                 }
                             }
                         }
@@ -59,10 +60,10 @@ pub fn user_daily<'a>(parts: &[Part<'a>], cats: &Categories<'a>) -> Vec<Vec<User
         .collect()
 }
 
-pub fn user_daily_cols(rows: &[Vec<UserDay<'_>>]) -> Vec<Col> {
+pub fn user_daily_cols(store: &Store<'_>, rows: &[Vec<UserDay<'_>>]) -> Vec<Col> {
     let all = || rows.iter().flatten();
     vec![
-        Col::Str(all().map(|r| r.user.to_vec()).collect()),
+        Col::Str(all().map(|r| store.get(r.user).to_vec()).collect()),
         Col::Date(all().map(|r| r.day).collect()),
         Col::I64(all().map(|r| r.sessions).collect()),
         Col::I64(all().map(|r| r.events).collect()),
@@ -82,7 +83,7 @@ pub struct CampaignDay<'a> {
 }
 
 /// One row per (campaign, day) that was credited or assisted; organic is the campaign "organic".
-pub fn campaign_daily<'a>(parts: &[Part<'a>], credit: &[Credit], camps: &Campaigns<'a>) -> Vec<CampaignDay<'a>> {
+pub fn campaign_daily<'a>(parts: &[Part], credit: &[Credit], camps: &Campaigns<'a>) -> Vec<CampaignDay<'a>> {
     let partial: Vec<FxMap<u64, [i64; 4]>> = parts
         .par_iter()
         .zip(credit.par_iter())
@@ -139,11 +140,11 @@ pub fn campaign_daily_cols(rows: &[CampaignDay<'_>]) -> Vec<Col> {
 
 /// user_daily as `nfiles` part files written in parallel (rules.md: file count does not matter); every file
 /// is written, even an empty one, so the folder always holds at least one.
-pub fn write_user_daily(dir: &std::path::Path, rows: &[Vec<UserDay<'_>>], nfiles: usize) -> parquet::errors::Result<()> {
+pub fn write_user_daily(store: &Store<'_>, dir: &std::path::Path, rows: &[Vec<UserDay<'_>>], nfiles: usize) -> parquet::errors::Result<()> {
     let nfiles = nfiles.clamp(1, rows.len().max(1));
     let per = rows.len().div_ceil(nfiles).max(1);
     (0..nfiles).into_par_iter().try_for_each(|f| {
         let group = &rows[(f * per).min(rows.len())..((f + 1) * per).min(rows.len())];
-        write_table(&dir.join(format!("part-{f}.parquet")), USER_DAILY, user_daily_cols(group))
+        write_table(&dir.join(format!("part-{f}.parquet")), USER_DAILY, user_daily_cols(store, group))
     })
 }

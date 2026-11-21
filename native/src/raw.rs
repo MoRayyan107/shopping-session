@@ -36,6 +36,16 @@ pub fn pieces(m: &Mapped) -> Vec<&[u8]> {
     m.files.iter().filter_map(|(_, f)| f.as_deref()).flat_map(|d| chunks(d, CHUNK)).collect()
 }
 
+/// Like `pieces`, with the Store index of each piece's file (`first` is the index of this input's first file).
+pub fn pieces_with_file(m: &Mapped, first: u32) -> Vec<(u32, &[u8])> {
+    m.files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, f))| f.as_deref().map(|d| (first + i as u32, d)))
+        .flat_map(|(i, d)| chunks(d, CHUNK).into_iter().map(move |p| (i, p)))
+        .collect()
+}
+
 /// Every well-formed data line of every file, in a deterministic order (file order, then line order).
 pub fn parse<const N: usize>(m: &Mapped) -> Vec<Row<'_, N>> {
     let pieces = pieces(m);

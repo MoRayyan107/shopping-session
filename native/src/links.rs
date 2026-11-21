@@ -1,60 +1,68 @@
 //! Stage 3: linked IDs (rules.md "Linked IDs"). Mirrors `pipeline/links.py::build_person_map`:
 //! edges are non-NULL, non-self links; each connected component is named by its byte-wise smallest ID.
 use crate::raw::Row;
+use crate::span::{Span, Store};
 use crate::util::{hash_bytes, FxMap};
 
-#[derive(Clone, Copy)]
-struct Slot<'a> {
+/// One renamed ID (32 bytes); `hash == 0` with `id == Span::EMPTY` marks an empty slot.
+#[derive(Clone, Copy, Default)]
+struct Slot {
     hash: u64,
-    id: &'a [u8],
-    person: &'a [u8],
+    id: Span,
+    person: Span,
     phash: u64,
 }
 
 /// The person map as an open-addressing table keyed by a precomputed hash of the ID, so a lookup for an
 /// ID that is not renamed (most of them) usually never reads the ID's bytes.
-pub struct PersonTable<'a> {
+pub struct PersonTable {
     mask: usize,
-    slots: Vec<Option<Slot<'a>>>,
+    slots: Vec<Slot>,
     /// one bit per (hash >> 32) & bit_mask: set for every renamed ID; a clear bit means "not renamed"
     bits: Vec<u64>,
     bit_mask: usize,
 }
 
-impl<'a> PersonTable<'a> {
-    pub fn new(map: &FxMap<&'a [u8], &'a [u8]>) -> PersonTable<'a> {
+impl PersonTable {
+    pub fn new<'a>(map: &FxMap<&'a [u8], &'a [u8]>, store: &Store<'a>) -> PersonTable {
         let cap = (map.len() * 2).next_power_of_two().max(16);
         let nbits = (map.len() * 16).next_power_of_two().max(64);
-        let mut slots: Vec<Option<Slot<'a>>> = vec![None; cap];
+        let mut slots: Vec<Slot> = vec![Slot::default(); cap];
         let mut bits = vec![0u64; nbits / 64];
         for (&id, &person) in map {
+            // renamed IDs are never empty (empty link sides are dropped), so a used slot has id != EMPTY
+            assert!(!id.is_empty());
             let hash = hash_bytes(id);
             let b = (hash >> 32) as usize & (nbits - 1);
             bits[b / 64] |= 1 << (b % 64);
             let mut i = hash as usize & (cap - 1);
-            while slots[i].is_some() {
+            while slots[i].id != Span::EMPTY {
                 i = (i + 1) & (cap - 1);
             }
-            slots[i] = Some(Slot { hash, id, person, phash: hash_bytes(person) });
+            slots[i] = Slot { hash, id: store.span_of(id), person: store.span_of(person), phash: hash_bytes(person) };
         }
         PersonTable { mask: cap - 1, slots, bits, bit_mask: nbits - 1 }
     }
 
     /// (person, hash of person) for a user ID whose hash_bytes() is `uhash`.
     #[inline]
-    pub fn lookup(&self, uhash: u64, user: &'a [u8]) -> (&'a [u8], u64) {
+    pub fn lookup(&self, uhash: u64, user: Span, store: &Store<'_>) -> (Span, u64) {
         let b = (uhash >> 32) as usize & self.bit_mask;
         if self.bits[b / 64] & (1 << (b % 64)) == 0 {
             return (user, uhash);
         }
+        let ubytes = store.get(user);
         let mut i = uhash as usize & self.mask;
-        while let Some(s) = &self.slots[i] {
-            if s.hash == uhash && s.id == user {
+        loop {
+            let s = &self.slots[i];
+            if s.id == Span::EMPTY {
+                return (user, uhash);
+            }
+            if s.hash == uhash && store.get(s.id) == ubytes {
                 return (s.person, s.phash);
             }
             i = (i + 1) & self.mask;
         }
-        (user, uhash)
     }
 }
 
