@@ -23,8 +23,9 @@ sys.path.insert(0, HERE)
 from csv_parse import load_table  # noqa: E402
 from events import build_events  # noqa: E402
 from links import build_person_map  # noqa: E402
-from outputs import (CAMPAIGN_DAILY_COLUMNS, USER_DAILY_COLUMNS, build_user_daily,  # noqa: E402
-                     empty_campaign_daily, write_parquet)
+from clicks import build_clicks  # noqa: E402
+from outputs import (CAMPAIGN_DAILY_COLUMNS, USER_DAILY_COLUMNS, build_campaign_daily,  # noqa: E402
+                     build_user_daily, self_checks, write_parquet)
 
 EVENTS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
 CLICKS = ["click_id", "user_id", "campaign_id", "ts"]
@@ -78,11 +79,15 @@ def main():
     j = lambda *p: os.path.join(data, *p)  # noqa: E731
     stage("parse events", lambda: load_table(con, "raw_events", j("events", "*.csv"), EVENTS), ["raw_events"])
     stage("parse links", lambda: load_table(con, "links", j("links", "*.csv"), LINKS), ["links"])
+    stage("parse clicks", lambda: load_table(con, "raw_clicks", j("clicks", "*.csv"), CLICKS), ["raw_clicks"])
     stage("parse products", lambda: load_table(con, "products", j("products.csv"), ["product_id", "category"]))
+    stage("parse campaigns", lambda: load_table(con, "campaigns", j("campaigns.csv"), ["campaign_id", "channel"]))
     stage("linked IDs", lambda: build_person_map(con, "links", scratch), ["person_map"])
     stage("events + sessions", lambda: build_events(con, ws, we, log), ["ev_sessioned", "sessions"])
     stage("user_daily", lambda: build_user_daily(con), ["user_daily"])
-    stage("campaign_daily (placeholder)", lambda: empty_campaign_daily(con))
+    stage("clicks + credit + assists", lambda: build_clicks(con, ws, we, log), ["ck_valid", "session_credit", "session_assist"])
+    stage("campaign_daily", lambda: build_campaign_daily(con), ["campaign_daily"])
+    stage("self-checks", lambda: self_checks(con, log))
 
     def write():
         write_parquet(con, "user_daily", USER_DAILY_COLUMNS, os.path.join(out, "user_daily"))
