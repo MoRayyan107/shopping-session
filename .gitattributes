@@ -1,0 +1,5 @@
+# Later lines win, so the general rule comes first.
+# Everything is text with LF in the repository (run.sh must never get a CRLF shebang) ...
+* text=auto eol=lf
+# ... except fixture data, which must be stored byte for byte: E20 relies on literal \r\n line endings.
+fixtures/** -text
