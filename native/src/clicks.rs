@@ -230,7 +230,7 @@ pub fn build<'a>(
                         clicks.push(bucket(person.hash()), Click { person, click_id: r.id, camp: r.camp_valid & !VALID, ts: r.ts });
                     }
                 };
-                dedup_find_into(recs.len(), |i| recs[i].id.hash(), table, groups);
+                dedup_find_into(recs.len(), recs.iter().map(|r| r.id.hash()), table, groups);
                 // unique ids in memory order (sequential reads), then the groups of copies
                 // the person table is random access: its filter word is requested 2D rows ahead, its slot D
                 const D: usize = PREFETCH_ROWS;

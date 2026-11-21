@@ -113,7 +113,7 @@ pub fn dedup_order(n: usize, idhash: impl Fn(usize) -> u64) -> Vec<u64> {
 /// later rows of a group are only listed, so the table never holds two slots of one group.
 pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>) -> (Vec<bool>, Vec<Vec<usize>>) {
     let mut g = Groups::default();
-    dedup_find_into(n, idhash, table, &mut g);
+    dedup_find_into(n, (0..n).map(idhash), table, &mut g);
     let groups = (0..g.len()).map(|i| g.group(i).iter().map(|&k| k as usize).collect()).collect();
     (g.alone, groups)
 }
@@ -141,7 +141,8 @@ impl Groups {
 }
 
 /// `dedup_find` into `g`, with no allocation once the buffers have grown.
-pub fn dedup_find_into(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>, g: &mut Groups) {
+/// `hashes` gives row i's id hash, for i in 0..n in order (exactly n of them).
+pub fn dedup_find_into(n: usize, hashes: impl Iterator<Item = u64>, table: &mut Vec<u64>, g: &mut Groups) {
     assert!(n < (1 << IDX_BITS) - 1, "a dedup bucket holds {n} rows, more than 2^{IDX_BITS} - 2");
     let mask = (1u64 << IDX_BITS) - 1;
     let bits = ((2 * n).max(16)).next_power_of_two().trailing_zeros();
@@ -151,9 +152,11 @@ pub fn dedup_find_into(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<
     // (first row of the group, a later row) for every row whose truncated hash was seen before
     let later = &mut g.later;
     later.clear();
-    for i in 0..n {
+    let mut seen = 0;
+    for (i, idh) in hashes.enumerate() {
+        seen += 1;
         // the same 40 bits as dedup_order: below the bucket bits, above the index bits
-        let h = (idhash(i) << PART_BITS) & !mask;
+        let h = (idh << PART_BITS) & !mask;
         let mut pos = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         loop {
             let s = table[pos];
@@ -168,6 +171,7 @@ pub fn dedup_find_into(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<
             pos = (pos + 1) & (cap - 1);
         }
     }
+    assert_eq!(seen, n, "dedup_find_into: {seen} hashes for {n} rows");
     g.alone.clear();
     g.alone.resize(n, true);
     g.rows.clear();
@@ -304,6 +308,33 @@ mod tests {
         assert_eq!(vecs[7].iter().map(|r| r.1).collect::<Vec<_>>(), vec![2, 5]);
         assert_eq!(vecs[128], vec![(128, 7)]);
         assert_eq!(vecs.iter().map(Vec::len).sum::<usize>(), 8);
+    }
+
+    #[test]
+    fn rows_view_equals_take() {
+        // the same rows in two Chunks: one taken as Rows, one copied out with take
+        let make = || {
+            let mut scatters: Vec<Scatter<u32>> = (0..3).map(|_| Scatter::default()).collect();
+            for (k, s) in scatters.iter_mut().enumerate() {
+                for i in 0..30_000u32 {
+                    s.push((i % 5) as usize, i * 3 + k as u32);
+                }
+            }
+            Chunks::new(scatters)
+        };
+        let (ch, ch2) = (make(), make());
+        for b in 0..NPARTS {
+            let rows = ch.take_rows(b);
+            let mut want = Vec::new();
+            ch2.take(b, &mut want);
+            assert_eq!(rows.len(), want.len());
+            assert_eq!(rows.is_empty(), want.is_empty());
+            assert_eq!(rows.iter().copied().collect::<Vec<_>>(), want);
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(rows.get(i), w);
+            }
+            assert_eq!(rows.chunks().iter().map(Vec::len).sum::<usize>(), want.len());
+        }
     }
 
     #[test]
@@ -470,6 +501,36 @@ impl<T> Scatter<T> {
     }
 }
 
+/// One bucket's rows as its chunks, in order, without copying them together: row i is in the chunk c with
+/// `starts[c] <= i < starts[c + 1]`.
+pub struct Rows<T> {
+    chunks: Vec<Vec<T>>,
+    starts: Vec<usize>,
+}
+
+impl<T> Rows<T> {
+    pub fn len(&self) -> usize {
+        *self.starts.last().unwrap()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The chunks in row order.
+    pub fn chunks(&self) -> &[Vec<T>] {
+        &self.chunks
+    }
+    /// Every row in order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.chunks.iter().flatten()
+    }
+    /// Row i (a binary search over the chunks; for the few rows read out of order).
+    #[inline]
+    pub fn get(&self, i: usize) -> &T {
+        let c = self.starts.partition_point(|&s| s <= i) - 1;
+        &self.chunks[c][i - self.starts[c]]
+    }
+}
+
 /// The rows of many `Scatter`s by bucket: bucket b is a list of chunks. A bucket can be taken out (and freed
 /// by its user) while the others stay, so each bucket's memory goes as soon as it is used.
 pub struct Chunks<T> {
@@ -503,6 +564,18 @@ impl<T: Copy + Send> Chunks<T> {
         for c in chunks {
             out.extend_from_slice(&c);
         }
+    }
+    /// Bucket b's chunks, moved out without copying (freed when the `Rows` is dropped).
+    pub fn take_rows(&self, b: usize) -> Rows<T> {
+        let chunks = std::mem::take(&mut *self.buckets[b].lock().unwrap());
+        let mut starts = Vec::with_capacity(chunks.len() + 1);
+        let mut n = 0;
+        starts.push(0);
+        for c in &chunks {
+            n += c.len();
+            starts.push(n);
+        }
+        Rows { chunks, starts }
     }
     /// Every row still held, bucket by bucket (dumps only).
     pub fn to_vec(&self) -> Vec<T> {

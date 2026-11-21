@@ -222,13 +222,13 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
 pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built {
     let mut t = std::time::Instant::now();
     let ids: Vec<usize> = (0..NPARTS).collect();
-    type State = (Vec<Rec>, Vec<u64>, Scatter<Event>, usize, Groups, Vec<usize>);
+    type State = (Vec<u64>, Scatter<Event>, usize, Groups, Vec<(Rec, usize)>);
     let states = for_each_in_order(
         &ids,
-        || (Vec::new(), Vec::new(), Scatter::default(), 0usize, Groups::default(), Vec::new()),
-        |(recs, table, events, kept, groups, gbuf): &mut State, &b| {
-                recs.clear();
-                by_id.take(b, recs);
+        || (Vec::new(), Scatter::default(), 0usize, Groups::default(), Vec::new()),
+        |(table, events, kept, groups, gbuf): &mut State, &b| {
+                // the bucket's chunks as they are (no copy into one buffer); freed at the end of this bucket
+                let recs = by_id.take_rows(b);
                 let emit = |r: &Rec, events: &mut Scatter<Event>| {
                     if (r.price_kind >> 24) as u8 != INVALID {
                         let person = ptab.lookup(r.user);
@@ -238,32 +238,38 @@ pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built
                         );
                     }
                 };
-                dedup_find_into(recs.len(), |i| recs[i].id.hash(), table, groups);
-                // unique ids in memory order (sequential reads), then the groups of copies
+                dedup_find_into(recs.len(), recs.iter().map(|r| r.id.hash()), table, groups);
+                // unique ids in memory order (sequential reads, chunk by chunk), then the groups of copies;
                 // the person table is random access: its filter word is requested 2D rows ahead, its slot D
+                // (within the chunk)
                 const D: usize = PREFETCH_ROWS;
-                for i in 0..recs.len() {
-                    if let Some(r) = recs.get(i + 2 * D) {
-                        ptab.prefetch_bits(r.user);
-                    }
-                    if let Some(r) = recs.get(i + D) {
-                        ptab.prefetch_slot(r.user);
-                    }
-                    if groups.alone[i] {
-                        *kept += 1;
-                        emit(&recs[i], events);
+                let mut i = 0;
+                for c in recs.chunks() {
+                    for j in 0..c.len() {
+                        if let Some(r) = c.get(j + 2 * D) {
+                            ptab.prefetch_bits(r.user);
+                        }
+                        if let Some(r) = c.get(j + D) {
+                            ptab.prefetch_slot(r.user);
+                        }
+                        if groups.alone[i] {
+                            *kept += 1;
+                            emit(&c[j], events);
+                        }
+                        i += 1;
                     }
                 }
                 for gi in 0..groups.len() {
-                    // a truncated-hash group: runs of one event_id (equal keys <=> equal IDs) by ingest_ts
+                    // a truncated-hash group: runs of one event_id (equal keys <=> equal IDs) by ingest_ts;
+                    // its rows copied out (copies are few) with their row numbers
                     gbuf.clear();
-                    gbuf.extend(groups.group(gi).iter().map(|&k| k as usize));
+                    gbuf.extend(groups.group(gi).iter().map(|&k| (*recs.get(k as usize), k as usize)));
                     let g = &mut *gbuf;
-                    g.sort_unstable_by_key(|&k| (recs[k].id, recs[k].ingest, k));
+                    g.sort_unstable_by_key(|(r, k)| (r.id, r.ingest, *k));
                     let mut a = 0;
                     while a < g.len() {
                         let mut z = a + 1;
-                        while z < g.len() && recs[g[z]].id == recs[g[a]].id {
+                        while z < g.len() && g[z].0.id == g[a].0.id {
                             z += 1;
                         }
                         let run = &g[a..z];
@@ -271,31 +277,31 @@ pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built
                         *kept += 1;
                         // the oracle keeps the first copy by (ingest_ts as a string, then the other columns):
                         // when every copy's ingest_ts is F1 and the smallest is unique, that is run[0]
-                        let unique_first = run.iter().all(|&k| recs[k].ingest != NO_INGEST)
-                            && (run.len() == 1 || recs[run[0]].ingest != recs[run[1]].ingest);
+                        let unique_first = run.iter().all(|(r, _)| r.ingest != NO_INGEST)
+                            && (run.len() == 1 || run[0].0.ingest != run[1].0.ingest);
                         if unique_first {
-                            emit(&recs[run[0]], events);
+                            emit(&run[0].0, events);
                             continue;
                         }
                         // otherwise the exact order from the lines themselves
                         let first = run
                             .iter()
-                            .map(|&k| {
+                            .map(|(r, k)| {
                                 let mut f = [None; 7];
-                                split_line(store.get(recs[k].line), &mut f);
-                                (f, k)
+                                split_line(store.get(r.line), &mut f);
+                                (f, *k, r)
                             })
                             .min_by(|x, y| copy_order(&x.0, &y.0).then(x.1.cmp(&y.1)))
                             .unwrap();
-                        emit(&recs[first.1], events);
+                        emit(first.2, events);
                     }
                 }
         },
     );
     drop(by_id);
     prof("events: dedup + person", &mut t);
-    let kept = states.iter().map(|s| s.3).sum();
-    let by_person = Chunks::new(states.into_iter().map(|s| s.2).collect());
+    let kept = states.iter().map(|s| s.2).sum();
+    let by_person = Chunks::new(states.into_iter().map(|s| s.1).collect());
     Built { by_person, kept }
 }
 
