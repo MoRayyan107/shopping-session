@@ -3,24 +3,17 @@
 --   ts_parse(s) -> BIGINT epoch milliseconds (UTC), or NULL when s is a bad timestamp.
 --
 -- Forms accepted (ASCII digits only, nothing else):
---   F1  YYYY-MM-DDTHH:MM:SSZ
---   F2  YYYY-MM-DDTHH:MM:SS+HH:MM / -HH:MM   (offset hour 00-23, minute 00-59, colon required)
+--   F1  YYYY-MM-DDTHH:MM:SSZ                   (20 characters)
+--   F2  YYYY-MM-DDTHH:MM:SS+HH:MM / -HH:MM     (25 characters; offset hour 00-23, minute 00-59)
 --   F3  digits only, epoch milliseconds, leading zeros allowed
 --
--- A real calendar check is done by hand (no lenient date casts): month 1-12, day within the month
--- (leap years by the Gregorian rule), hour <= 23, minute <= 59, second <= 59.
+-- No regular expressions: translate() maps every ASCII digit to '0', and the result must equal a fixed
+-- template, so a non-ASCII digit, a missing or extra character or a wrong separator fails the shape test.
+-- Fields are then read at fixed positions. The calendar check is done by hand (no lenient date casts):
+-- month 1-12, day within the month (Gregorian leap years), hour <= 23, minute <= 59, second <= 59, year >= 1.
 --
--- F3 values with more than 18 significant digits (> 1e18 ms, i.e. beyond any window and beyond
--- what fits comfortably in a BIGINT) return NULL. rules.md calls these "valid but outside the
+-- F3 values with more than 18 significant digits return NULL. rules.md calls these "valid but outside the
 -- window"; every caller drops them either way, because they fail the window test, so NULL is safe.
--- A parsed value that is merely very small or very large (e.g. 86400000, year 0001) is returned as is
--- and is rejected later by the window check.
-
-CREATE OR REPLACE MACRO ts_pat() AS
-  '^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:Z|([+-])([0-9]{2}):([0-9]{2}))$';
-
-CREATE OR REPLACE MACRO ts_g(s, i) AS regexp_extract(s, ts_pat(), i);
-CREATE OR REPLACE MACRO ts_n(s, i) AS TRY_CAST(ts_g(s, i) AS BIGINT);
 
 CREATE OR REPLACE MACRO ts_leap(y) AS (y % 4 = 0 AND (y % 100 <> 0 OR y % 400 = 0));
 
@@ -40,33 +33,36 @@ CREATE OR REPLACE MACRO ts_days_yy(yy, m, d) AS (
   - 719468);
 CREATE OR REPLACE MACRO ts_days(y, m, d) AS ts_days_yy(y - CASE WHEN m <= 2 THEN 1 ELSE 0 END, m, d);
 
--- Is s a well-formed, real F1/F2 value?
-CREATE OR REPLACE MACRO ts_f12_ok(s) AS (
-  regexp_full_match(s, ts_pat())
-  AND ts_n(s, 1) >= 1
-  AND ts_n(s, 2) BETWEEN 1 AND 12
-  AND ts_n(s, 3) BETWEEN 1 AND ts_dim(ts_n(s, 1), ts_n(s, 2))
-  AND ts_n(s, 4) <= 23 AND ts_n(s, 5) <= 59 AND ts_n(s, 6) <= 59
-  AND (ts_g(s, 7) = '' OR (ts_n(s, 8) <= 23 AND ts_n(s, 9) <= 59))
-);
+-- Digit-shape of a string: every ASCII digit becomes '0'.
+CREATE OR REPLACE MACRO ts_shape(s) AS translate(s, '0123456789', '0000000000');
 
--- Epoch ms of an F1/F2 value; only meaningful when ts_f12_ok(s).
-CREATE OR REPLACE MACRO ts_f12_ms(s) AS (
-  (ts_days(ts_n(s, 1), ts_n(s, 2), ts_n(s, 3)) * 86400 + ts_n(s, 4) * 3600 + ts_n(s, 5) * 60 + ts_n(s, 6)) * 1000
-  - CASE ts_g(s, 7)
-      WHEN '+' THEN  (ts_n(s, 8) * 60 + ts_n(s, 9)) * 60000
-      WHEN '-' THEN -(ts_n(s, 8) * 60 + ts_n(s, 9)) * 60000
-      ELSE 0
-    END);
+-- A fixed-position number; the shape test has already proved these characters are ASCII digits.
+CREATE OR REPLACE MACRO ts_num(s, pos, len) AS TRY_CAST(substr(s, pos, len) AS BIGINT);
 
--- F3: digits only, leading zeros stripped; the all-zero string is 0.
-CREATE OR REPLACE MACRO ts_f3_digits(s) AS (CASE WHEN regexp_replace(s, '^0+', '') = '' THEN '0' ELSE regexp_replace(s, '^0+', '') END);
+-- y, mo, d, h, mi, se: date and time fields; offset_min: signed offset in minutes (0 for Z).
+CREATE OR REPLACE MACRO ts_f12_ms(y, mo, d, h, mi, se, oh, om, sign) AS (
+  CASE WHEN y >= 1 AND mo BETWEEN 1 AND 12 AND d BETWEEN 1 AND ts_dim(y, mo)
+            AND h <= 23 AND mi <= 59 AND se <= 59 AND oh <= 23 AND om <= 59
+       THEN (ts_days(y, mo, d) * 86400 + h * 3600 + mi * 60 + se) * 1000 - sign * (oh * 60 + om) * 60000
+  END);
+
+CREATE OR REPLACE MACRO ts_f12(s, has_offset) AS ts_f12_ms(
+  ts_num(s, 1, 4), ts_num(s, 6, 2), ts_num(s, 9, 2), ts_num(s, 12, 2), ts_num(s, 15, 2), ts_num(s, 18, 2),
+  CASE WHEN has_offset THEN ts_num(s, 21, 2) ELSE 0 END,
+  CASE WHEN has_offset THEN ts_num(s, 24, 2) ELSE 0 END,
+  CASE WHEN NOT has_offset THEN 0 WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END);
+
+-- F3: leading zeros stripped; the all-zero string is 0.
+CREATE OR REPLACE MACRO ts_f3(s) AS (
+  CASE WHEN ltrim(s, '0') = '' THEN 0
+       WHEN length(ltrim(s, '0')) <= 18 THEN TRY_CAST(ltrim(s, '0') AS BIGINT)
+  END);
 
 CREATE OR REPLACE MACRO ts_parse(s) AS (
   CASE
-    WHEN s IS NULL THEN NULL
-    WHEN regexp_full_match(s, '[0-9]+')
-      THEN (CASE WHEN length(ts_f3_digits(s)) <= 18 THEN TRY_CAST(ts_f3_digits(s) AS BIGINT) ELSE NULL END)
-    WHEN ts_f12_ok(s) THEN ts_f12_ms(s)
+    WHEN s IS NULL OR s = '' THEN NULL
+    WHEN translate(s, '0123456789', '') = '' THEN ts_f3(s)
+    WHEN ts_shape(s) = '0000-00-00T00:00:00Z' THEN ts_f12(s, false)
+    WHEN ts_shape(s) = '0000-00-00T00:00:00+00:00' OR ts_shape(s) = '0000-00-00T00:00:00-00:00' THEN ts_f12(s, true)
     ELSE NULL
   END);
