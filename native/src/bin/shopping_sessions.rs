@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
-use shopping_sessions_native::{daily, events, links, sessions};
+use shopping_sessions_native::{clicks, daily, events, links, sessions};
 use shopping_sessions_native::pq::Col;
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
@@ -163,6 +163,71 @@ fn main() {
     if dump.on() {
         dump.table("user_daily", shopping_sessions_native::pq::USER_DAILY, || daily::user_daily_cols(&ud));
         clock.lap("dump stage 5", "user_daily");
+    }
+
+    // Stage 6: clicks, credit, assists
+    let camps = clicks::campaign_map(&campaigns);
+    let ck = clicks::valid_clicks(&raw_clicks, &pmap, &camps, ws, we);
+    clock.lap("clicks dedup + validate", ck.len());
+    let cr = clicks::credit(&parts, &ck);
+    clock.lap(
+        "credit + assists",
+        format!(
+            "{} credited, {} assists",
+            cr.iter().map(|c| c.credit.iter().filter(|x| x.is_some()).count()).sum::<usize>(),
+            cr.iter().map(|c| c.assists.len()).sum::<usize>()
+        ),
+    );
+    if dump.on() {
+        dump.table(
+            "ck_valid",
+            "message ck_valid { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL BYTE_ARRAY click_id (STRING); \
+             OPTIONAL BYTE_ARRAY campaign_id (STRING); OPTIONAL INT64 ts_ms; }",
+            || {
+                vec![
+                    Col::OptStr(ck.iter().map(|c| Some(c.person.to_vec())).collect()),
+                    Col::OptStr(ck.iter().map(|c| Some(c.click_id.to_vec())).collect()),
+                    Col::OptStr(ck.iter().map(|c| Some(c.campaign.to_vec())).collect()),
+                    Col::OptI64(ck.iter().map(|c| Some(c.ts)).collect()),
+                ]
+            },
+        );
+        let sc = || {
+            parts.iter().zip(&cr).flat_map(|(p, c)| p.sessions.iter().zip(&c.credit))
+        };
+        dump.table(
+            "session_credit",
+            "message session_credit { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 session_start; \
+             OPTIONAL INT32 day (DATE); OPTIONAL BOOLEAN has_purchase; OPTIONAL INT64 revenue_cents; \
+             OPTIONAL BYTE_ARRAY campaign_id (STRING); }",
+            || {
+                vec![
+                    Col::OptStr(sc().map(|(s, _)| Some(s.person.to_vec())).collect()),
+                    Col::OptI64(sc().map(|(s, _)| Some(s.start)).collect()),
+                    Col::OptDate(sc().map(|(s, _)| Some(s.day)).collect()),
+                    Col::OptBool(sc().map(|(s, _)| Some(s.has_purchase)).collect()),
+                    Col::OptI64(sc().map(|(s, _)| Some(s.revenue)).collect()),
+                    Col::OptStr(sc().map(|(_, c)| Some(c.unwrap_or(b"organic").to_vec())).collect()),
+                ]
+            },
+        );
+        let sa = || {
+            parts.iter().zip(&cr).flat_map(|(p, c)| c.assists.iter().map(move |(i, k)| (&p.sessions[*i as usize], *k)))
+        };
+        dump.table(
+            "session_assist",
+            "message session_assist { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 session_start; \
+             OPTIONAL INT32 day (DATE); OPTIONAL BYTE_ARRAY campaign_id (STRING); }",
+            || {
+                vec![
+                    Col::OptStr(sa().map(|(s, _)| Some(s.person.to_vec())).collect()),
+                    Col::OptI64(sa().map(|(s, _)| Some(s.start)).collect()),
+                    Col::OptDate(sa().map(|(s, _)| Some(s.day)).collect()),
+                    Col::OptStr(sa().map(|(_, k)| Some(k.to_vec())).collect()),
+                ]
+            },
+        );
+        clock.lap("dump stage 6", "ck_valid, session_credit, session_assist");
     }
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());
