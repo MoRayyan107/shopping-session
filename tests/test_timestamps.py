@@ -13,9 +13,11 @@ import datetime as dt
 import random
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 import duckdb
+import polars as pl
 
 MACROS = Path(__file__).resolve().parent.parent / "pipeline" / "ts_macros.sql"
 
@@ -233,8 +235,10 @@ def main():
     # ---- 2. fuzz table against the reference
     rng = random.Random(20261120)
     inputs = fuzz_inputs(300_000, rng)
-    con.execute("CREATE TABLE fuzz(i BIGINT, s VARCHAR)")
-    con.executemany("INSERT INTO fuzz VALUES (?, ?)", list(enumerate(inputs)))
+    with tempfile.TemporaryDirectory() as tmp:               # bulk load through Parquet; executemany is far too slow
+        path = Path(tmp) / "fuzz.parquet"
+        pl.DataFrame({"i": range(len(inputs)), "s": inputs}).write_parquet(path)
+        con.execute(f"CREATE TABLE fuzz AS SELECT i, s FROM read_parquet('{path.as_posix()}')")
     got = con.execute("SELECT i, ts_parse(s) FROM fuzz ORDER BY i").fetchall()
     diffs = [(inputs[i], ref_parse(inputs[i]), g) for i, g in got if ref_parse(inputs[i]) != g]
     for s, w, g in diffs[:20]:
