@@ -1,0 +1,374 @@
+diff --git a/NOTES.md b/NOTES.md
+index 444c8f2..0415b19 100644
+--- a/NOTES.md
++++ b/NOTES.md
+@@ -244,7 +244,7 @@ read IDs from the input at random. The threshold is between 8 and 10 GiB; the sc
+ layout (2.83-2.92 s with, 2.51-2.55 s without; `597cf7d` 2.70-2.77 s) and at p60m 12g gave 13.1 s with against
+ 9.3 / 11.8 s without, for 0.2 GB less anon (5.68 vs 5.86 GB). The smaller layout is what fixed p60m.
+ 
+-Practice score of `597cf7d` on the scorer: 4.09 s, correct (leaders 0.75-0.94 s).
++Practice scores on the scorer: `597cf7d` 4.09 s, `dcc09e9` 3.88 s, both correct (leaders 0.75-0.94 s).
+ 
+ Optimisation history at 20M (in Docker, tmpfs output): first exact run 14.1 s; campaigns interned (credit +
+ assists 5.2 -> 0.5 s) 12.4 s; validate while parsing, id buckets then person buckets, person-hash sorting
+@@ -258,3 +258,28 @@ SWAR line/field splitting, smaller records (offsets instead of slices), a dictio
+ 
+ A design (for approval) for a native Rust pipeline. The practice data is about 20M events, the leaders are
+ at 1 to 1.5 s, and the final is about 60M events with a 3-minute cap.
++
++## Speed work (branch `speed`, in progress, NOT verified, NOT committed except 43d68e3 = NOTES only)
++
++Cold vs warm, p20m, `dcc09e9` (`tests/scorer_run.sh`, `COLD=1` drops the Docker VM page cache with
++`echo 1 > /proc/sys/vm/drop_caches` in a privileged container): cold whole run 3.80-4.18 s, pipeline 3.36-3.68 s
++(the scorer's 3.88 s is a cold number); warm 2.94-2.99 s / 2.48-2.52 s. About 1.0-1.2 s is waiting for the disk,
++almost all in the events split (cold 1.7 s, warm 0.93 s). Raw cold read of p20m (1.83 GB): 1.06 s with one
++reader, 0.57 s with 8 parallel `cat`s (3.2 GB/s): the I/O floor here. ~0.45 s per run is outside the pipeline
++(container start/stop, wrapper).
++
++Uncommitted candidate in the working tree (unverified against the oracle):
++- `raw::prefetch`: madvise WILLNEED over the files in order of use, N threads taking 4 MB chunks from a shared
++  counter; links first, events + clicks started after the links are parsed (`NATIVE_PREFETCH=0`, `_MB`,
++  `_THREADS`, `_MODE=read` for pread instead of madvise). Mappings leaked as `&'static` for the threads.
++- `util::map_in_order`: events/clicks pieces handed out strictly in order (results in piece order).
++- Results cold: pipeline 2.85-2.92 s, wall 3.31-3.39 s (vs 3.36-3.52 / 3.80-4.01); warm unchanged (2.50 s).
++  pread mode is no better (2.94-3.12 s). Parsing links inside the join branch was worse (person map becomes the
++  critical path) and was reverted. Cold split still ~1.3 s vs 0.93 warm.
++
++Environment: `D:` is a USB drive (WD P40) that Windows powers off when idle ("USB selective suspend"); each time,
++Docker Desktop loses its `D:` share ("mkdir /run/desktop/mnt/host/d: file exists") until Docker is restarted.
++Fix: disable USB selective suspend, or work from a clone on `C:`. Data volumes live on the internal NVMe.
++
++Next: verify the prefetch candidate (61 datasets + p20m + p60m 12g/10g), commit; then compute: split 0.93 s,
++dedup 0.57 s, sessions 0.35 s, clicks 0.33 s, credit 0.12 s, write 0.09 s (warm p20m).
+diff --git a/native/src/bin/shopping_sessions.rs b/native/src/bin/shopping_sessions.rs
+index cc2ba00..e186af5 100644
+--- a/native/src/bin/shopping_sessions.rs
++++ b/native/src/bin/shopping_sessions.rs
+@@ -7,7 +7,7 @@ use std::time::Instant;
+ use shopping_sessions_native::dump::Dumper;
+ use shopping_sessions_native::events::{Event, PURCHASE, TYPE_NAMES};
+ use shopping_sessions_native::pq::{write_table, Col, CAMPAIGN_DAILY, USER_DAILY};
+-use shopping_sessions_native::raw::{parse, Mapped};
++use shopping_sessions_native::raw::{parse, prefetch, Mapped};
+ use shopping_sessions_native::span::Store;
+ use shopping_sessions_native::ts::parse_ts;
+ use shopping_sessions_native::{clicks, daily, events, links, sessions};
+@@ -55,25 +55,39 @@ fn main() {
+     eprintln!("window [{ws}, {we}) ms");
+ 
+     // Stage 1: parse
+-    let ev_files = Mapped::dir(&data.join("events")).expect("map events");
+-    let ck_files = Mapped::dir(&data.join("clicks")).expect("map clicks");
+-    let ln_files = Mapped::dir(&data.join("links")).expect("map links");
++    // the mappings live until the process exits, so they are leaked as &'static (the prefetch thread borrows them)
++    let ev_files: &'static Mapped = Box::leak(Box::new(Mapped::dir(&data.join("events")).expect("map events")));
++    let ck_files: &'static Mapped = Box::leak(Box::new(Mapped::dir(&data.join("clicks")).expect("map clicks")));
++    let ln_files: &'static Mapped = Box::leak(Box::new(Mapped::dir(&data.join("links")).expect("map links")));
++    // read-ahead: the links first (they are parsed before anything else), the events and clicks once the
++    // links are in, so the small links read never queues behind a gigabyte of event reads
++    let pf_on = std::env::var("NATIVE_PREFETCH").as_deref() != Ok("0");
++    let pf_step = std::env::var("NATIVE_PREFETCH_MB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4) << 20;
++    let pf_threads = std::env::var("NATIVE_PREFETCH_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
++    if pf_on {
++        prefetch(&[ln_files], pf_step, pf_threads);
++    }
+     let pr_file = Mapped::file(&data.join("products.csv")).expect("map products.csv");
+     let ca_file = Mapped::file(&data.join("campaigns.csv")).expect("map campaigns.csv");
+     clock.lap("map files", format!("{:.0} MB", (ev_files.bytes() + ck_files.bytes() + ln_files.bytes()) as f64 / 1e6));
+     // every string is an 8-byte Span into these files (or the side store)
+-    let (store, first) = Store::new(&[&ev_files, &ck_files, &ln_files]);
++    let (store, first) = Store::new(&[ev_files, ck_files, ln_files]);
+     let links = parse::<2>(&ln_files);
++    if pf_on {
++        prefetch(&[ev_files, ck_files], pf_step, pf_threads);
++    }
+     let products = parse::<2>(&pr_file);
+     let campaigns = parse::<2>(&ca_file);
+     clock.lap("parse links, products, campaigns", format!("{} / {} / {}", links.len(), products.len(), campaigns.len()));
+     dump.raw("links", ["user_id_a", "user_id_b"], &links);
+     // Stage 2 pass 1 (split + validate events) runs while one thread does stage 3 (linked IDs)
+     let cats = events::Categories::new(&products);
+-    let (ev_split, (n_renamed, ptab)) = rayon::join(
++    let (ev_split, (n_links, n_renamed, ptab)) = rayon::join(
+         || events::split(&ev_files, first[0], &store, &cats, ws, we),
+         || {
++            let mut t0 = std::time::Instant::now();
+             let m = links::person_map(&links);
++            shopping_sessions_native::util::prof("links: person map (one thread, beside the split)", &mut t0);
+             let t = links::PersonTable::new(&m, &store);
+             dump.table("person_map", &format!("message person_map {{ {S} id (STRING); {S} person (STRING); }}"), || {
+                 vec![
+@@ -81,11 +95,13 @@ fn main() {
+                     Col::OptStr(m.values().map(|v| Some(v.to_vec())).collect()),
+                 ]
+             });
+-            (m.len(), t)
++            (links.len(), m.len(), t)
+         },
+     );
+-    drop(links);
+-    clock.lap("events split + validate | linked IDs", format!("{} lines | {} renamed IDs", ev_split.len(), n_renamed));
++    clock.lap(
++        "events split + validate | links, linked IDs",
++        format!("{} lines | {} links, {} renamed IDs", ev_split.len(), n_links, n_renamed),
++    );
+     let built = events::dedup(ev_split, &ptab, &store);
+     clock.lap(
+         "events dedup + person",
+diff --git a/native/src/clicks.rs b/native/src/clicks.rs
+index 42f01e6..8e64b68 100644
+--- a/native/src/clicks.rs
++++ b/native/src/clicks.rs
+@@ -10,7 +10,7 @@ use crate::raw::{pieces_with_file, Mapped, Row};
+ use crate::sessions::{cmp_person, group_by_person, same_person, Part};
+ use crate::span::{Span, Store};
+ use crate::ts::parse_ts;
+-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, sort_by_bucket, Buckets, FxMap, PART_BITS};
++use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, map_in_order, sort_by_bucket, Buckets, FxMap, PART_BITS};
+ 
+ pub const WEEK_MS: i64 = 604_800_000;
+ pub const ORGANIC: &[u8] = b"organic";
+@@ -144,9 +144,7 @@ pub fn build<'a>(
+     let bucket = |h: u64| (h >> (64 - PART_BITS)) as usize;
+     assert!(camps.names.len() < VALID as usize, "too many campaigns");
+     // pass 1: split + validate every line; each piece's records ordered by click_id-hash bucket
+-    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = pieces_with_file(files, first)
+-        .par_iter()
+-        .map_init(Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
++    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+             recs.clear();
+             let mut f: Row<'a, 4> = [None; 4];
+             for line in lines(piece) {
+@@ -181,8 +179,7 @@ pub fn build<'a>(
+                 recs.push(rec);
+             }
+             sort_by_bucket(recs, |r| bucket(r.idhash))
+-        })
+-        .collect();
++        });
+     let by_id = Buckets::new(blocks);
+     // pass 2: dedup each id bucket; kept valid clicks go to person buckets
+     let out: Vec<(Vec<Click>, Vec<u32>)> = (0..nparts)
+diff --git a/native/src/events.rs b/native/src/events.rs
+index d8854b1..6a4dc89 100644
+--- a/native/src/events.rs
++++ b/native/src/events.rs
+@@ -15,7 +15,7 @@ use crate::links::PersonTable;
+ use crate::raw::{pieces_with_file, Mapped, Row};
+ use crate::span::{Span, Store};
+ use crate::ts::{parse_price, parse_ts};
+-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
++use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
+ 
+ pub const VIEW: u8 = 0;
+ pub const CART: u8 = 1;
+@@ -159,9 +159,7 @@ fn bucket(h: u64) -> usize {
+ /// Pass 1: split + validate every line; each piece's records ordered by hash(event_id) bucket.
+ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Categories<'_>, ws: i64, we: i64) -> Buckets<Rec> {
+     let mut t = std::time::Instant::now();
+-    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = pieces_with_file(files, first)
+-        .par_iter()
+-        .map_init(Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
++    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+             recs.clear();
+             let mut f: Row<'_, 7> = [None; 7];
+             for line in lines(piece) {
+@@ -194,8 +192,7 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
+                 recs.push(rec);
+             }
+             sort_by_bucket(recs, |r| bucket(r.idhash))
+-        })
+-        .collect();
++        });
+     prof("events: split + validate into blocks", &mut t);
+     Buckets::new(blocks)
+ }
+diff --git a/native/src/raw.rs b/native/src/raw.rs
+index 87416ff..a8c187b 100644
+--- a/native/src/raw.rs
++++ b/native/src/raw.rs
+@@ -27,6 +27,65 @@ impl Mapped {
+     }
+ }
+ 
++/// Ask the kernel to start reading these inputs now (madvise WILLNEED), in order, `step` bytes per call, so
++/// the disk works while the parse threads run. Only a hint: it never changes what is read.
++/// `threads` threads take the next chunk in order from a shared counter, so up to `threads` requests are in
++/// flight while the order stays the order of use.
++pub fn prefetch(inputs: &[&'static Mapped], step: usize, threads: usize) {
++    #[cfg(unix)]
++    {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        use std::sync::Arc;
++        let mut chunks: Vec<(&'static Mmap, usize, usize)> = Vec::new();
++        for m in inputs {
++            for f in m.files.iter().filter_map(|(_, f)| f.as_ref()) {
++                let mut off = 0;
++                while off < f.len() {
++                    let len = step.min(f.len() - off);
++                    chunks.push((f, off, len));
++                    off += len;
++                }
++            }
++        }
++        let chunks = Arc::new(chunks);
++        let next = Arc::new(AtomicUsize::new(0));
++        // NATIVE_PREFETCH_MODE=read: read each chunk with pread into a scratch buffer (it lands in the page
++        // cache, which the mapping shares) instead of madvise
++        let read = std::env::var("NATIVE_PREFETCH_MODE").as_deref() == Ok("read");
++        let paths: Arc<Vec<(usize, std::path::PathBuf)>> = Arc::new(
++            inputs
++                .iter()
++                .flat_map(|m| m.files.iter().filter_map(|(p, f)| f.as_ref().map(|f| (f.as_ptr() as usize, p.clone()))))
++                .collect(),
++        );
++        for _ in 0..threads.max(1) {
++            let (chunks, next, paths) = (chunks.clone(), next.clone(), paths.clone());
++            std::thread::spawn(move || {
++                use std::os::unix::fs::FileExt;
++                let mut buf = if read { vec![0u8; step] } else { Vec::new() };
++                let mut open: Option<(usize, std::fs::File)> = None;
++                loop {
++                    let i = next.fetch_add(1, Ordering::Relaxed);
++                    let Some(&(f, off, len)) = chunks.get(i) else { break };
++                    if !read {
++                        let _ = f.advise_range(memmap2::Advice::WillNeed, off, len);
++                        continue;
++                    }
++                    let key = f.as_ptr() as usize;
++                    if open.as_ref().is_none_or(|o| o.0 != key) {
++                        let Some((_, p)) = paths.iter().find(|(k, _)| *k == key) else { continue };
++                        match std::fs::File::open(p) {
++                            Ok(file) => open = Some((key, file)),
++                            Err(_) => continue,
++                        }
++                    }
++                    let _ = open.as_ref().unwrap().1.read_at(&mut buf[..len], off as u64);
++                }
++            });
++        }
++    }
++}
++
+ pub type Row<'a, const N: usize> = [Option<&'a [u8]>; N];
+ 
+ const CHUNK: usize = 4 << 20;
+diff --git a/native/src/util.rs b/native/src/util.rs
+index b9f0e1a..df37bb7 100644
+--- a/native/src/util.rs
++++ b/native/src/util.rs
+@@ -190,6 +190,38 @@ mod tests {
+ 
+ pub const NPARTS: usize = 1 << PART_BITS;
+ 
++/// `f` over `items` on every pool thread, handing items out strictly in order (a shared counter), so the
++/// work moves through the input front to back, behind the read-ahead. Results are in item order, exactly
++/// as `items.par_iter().map_init(init, f).collect()` would give them.
++pub fn map_in_order<T, S, R, I, F>(items: &[T], init: I, f: F) -> Vec<R>
++where
++    T: Sync,
++    R: Send + Sync,
++    I: Fn() -> S + Sync,
++    F: Fn(&mut S, &T) -> R + Sync,
++{
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::OnceLock;
++    let out: Vec<OnceLock<R>> = (0..items.len()).map(|_| OnceLock::new()).collect();
++    let next = AtomicUsize::new(0);
++    rayon::scope(|s| {
++        for _ in 0..rayon::current_num_threads() {
++            s.spawn(|_| {
++                let mut state = init();
++                loop {
++                    let i = next.fetch_add(1, Ordering::Relaxed);
++                    if i >= items.len() {
++                        break;
++                    }
++                    let r = f(&mut state, &items[i]);
++                    assert!(out[i].set(r).is_ok(), "item {i} done twice");
++                }
++            });
++        }
++    });
++    out.into_iter().map(|c| c.into_inner().expect("every item is done")).collect()
++}
++
+ /// Rows of many blocks, each block ordered by bucket (0..NPARTS) with the start of every bucket, so bucket
+ /// b is the run of slices blocks[k][start[b]..start[b+1]] in block order. Nothing is copied to build it.
+ pub struct Buckets<T> {
+diff --git a/tests/bench_native.sh b/tests/bench_native.sh
+new file mode 100644
+index 0000000..1905c2b
+--- /dev/null
++++ b/tests/bench_native.sh
+@@ -0,0 +1,33 @@
++#!/bin/sh
++# Time the submitted image against a candidate binary on a dataset in a Docker volume, alternating runs,
++# with the scorer's docker flags (memory MEM, default 12g). Usage:
++#   sh tests/bench_native.sh VOLUME RUNS [BASE_IMAGE]
++# The candidate is /target/release/shopping_sessions in the native-target volume (cargo build --release).
++# Prints one line per run: which, pipeline total (from its stderr) and docker wall time.
++set -eu
++VOL="$1"; RUNS="$2"; BASE="${3:-shopping-sessions:latest}"; MEM="${MEM:-12g}"
++export MSYS_NO_PATHCONV=1
++docker volume create bench_out >/dev/null
++docker volume create bench_scratch >/dev/null
++run() {
++  docker run --rm --user 0 -v bench_out:/o -v bench_scratch:/s --entrypoint sh "$BASE" -c 'rm -rf /o/* /s/*; chmod 777 /o /s'
++  flags="--rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
++    --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 8 --memory $MEM --memory-swap $MEM \
++    --user 1000:1000 -v $VOL:/data:ro -v bench_out:/output -v bench_scratch:/scratch \
++    -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=8 -e MEM_GB=${MEM%g}"
++  s=$(date +%s%N)
++  if [ "$1" = base ]; then
++    log=$(docker run $flags "$BASE" 2>&1 >/dev/null)
++  else
++    log=$(docker run $flags -v native-target:/target:ro --entrypoint /target/release/shopping_sessions "$BASE" 2>&1 >/dev/null)
++  fi
++  e=$(date +%s%N)
++  echo "$1 $(echo "$log" | grep total | tr -s ' ') wall $(( (e - s) / 1000000 )) ms"
++}
++docker run --rm --user 0 -v bench_out:/o -v bench_scratch:/s --entrypoint sh "$BASE" -c 'chmod 777 /o /s'
++i=0
++while [ $i -lt "$RUNS" ]; do
++  run base
++  run cand
++  i=$((i + 1))
++done
+diff --git a/tests/scorer_run.sh b/tests/scorer_run.sh
+index 1cb0e13..90cdd4c 100644
+--- a/tests/scorer_run.sh
++++ b/tests/scorer_run.sh
+@@ -1,6 +1,8 @@
+ #!/bin/sh
+ # One scorer-style run of an image on a dataset held in a Docker volume, keeping everything for the record:
+ #   sh tests/scorer_run.sh IMAGE DATA_VOLUME NAME [MEM]        (MEM default 12g; env EXTRA_ENV="-e K=V ...")
++# COLD=1 drops the Docker VM's page cache first (privileged container), so the input is read from disk.
++# A candidate binary: BIN=/target/release/shopping_sessions EXTRA_MOUNT="-v native-target:/target:ro".
+ # The container is kept (no --rm, named run_NAME). It writes to the volumes out_NAME / scr_NAME, and the
+ # outputs are copied to $HOSTDIR/NAME (default ../dockertmp/NAME) for scripts/compare.py.
+ # Inside, a sampler records anon/file memory (cgroup memory.stat) every 0.2 s; memory.peak is read at the end.
+@@ -16,6 +18,9 @@ docker rm -f "run_$NAME" >/dev/null 2>&1 || true
+ for v in "out_$NAME" "scr_$NAME"; do docker volume create "$v" >/dev/null; done
+ docker run --rm --user 0 -v "out_$NAME":/o -v "scr_$NAME":/s --entrypoint sh "$IMAGE" \
+   -c 'rm -rf /o/* /s/*; chmod 777 /o /s'
++if [ "${COLD:-0}" = 1 ]; then
++  docker run --rm --privileged --user 0 --entrypoint sh "$IMAGE" -c 'sync; echo 1 > /proc/sys/vm/drop_caches'
++fi
+ s=$(date +%s%N)
+ # TIMEOUT_S: stop the container after that many seconds (the run is then recorded as exit 137)
+ killer=""; if [ -n "${TIMEOUT_S:-}" ]; then (sleep "$TIMEOUT_S"; docker stop -t 1 "run_$NAME" >/dev/null 2>&1) & killer=$!; fi
+@@ -26,11 +31,11 @@ docker run --name "run_$NAME" --platform linux/amd64 \
+   --user 1000:1000 \
+   -v "$VOL":/data:ro -v "out_$NAME":/output -v "scr_$NAME":/scratch \
+   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+-  -e NCPU=8 -e MEM_GB="${MEM%g}" ${EXTRA_ENV:-} \
++  -e NCPU=8 -e MEM_GB="${MEM%g}" ${EXTRA_ENV:-} ${EXTRA_MOUNT:-} -e BIN="${BIN:-/app/shopping_sessions}" \
+   --entrypoint sh "$IMAGE" -c '
+     ( while :; do awk "/^(anon|file|pgmajfault) /{printf \"%s \", \$2} END{print \"\"}" /sys/fs/cgroup/memory.stat; sleep 0.2; done ) > /scratch/mem.log &
+     sampler=$!
+-    /app/shopping_sessions 2> /scratch/log.txt; code=$?
++    "$BIN" 2> /scratch/log.txt; code=$?
+     kill $sampler
+     echo $code > /scratch/exit
+     cat /sys/fs/cgroup/memory.peak > /scratch/peak

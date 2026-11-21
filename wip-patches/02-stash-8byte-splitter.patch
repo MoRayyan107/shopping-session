@@ -1,0 +1,165 @@
+diff --git a/native/src/csv.rs b/native/src/csv.rs
+index 71e106a..6534087 100644
+--- a/native/src/csv.rs
++++ b/native/src/csv.rs
+@@ -9,9 +9,83 @@ use std::path::{Path, PathBuf};
+ 
+ use memmap2::Mmap;
+ 
++const LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
++const ONES: u64 = 0x0101_0101_0101_0101;
++
++/// High bit set in exactly the bytes of `w` equal to `b` (no carries between bytes, so no false hits).
++#[inline(always)]
++fn eq_mask(w: u64, b: u8) -> u64 {
++    let x = w ^ (ONES * b as u64);
++    !(((x & LO7) + LO7) | x | LO7)
++}
++
++#[inline(always)]
++fn word(s: &[u8], i: usize) -> u64 {
++    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
++}
++
++/// Whether `s` contains a double quote, 8 bytes at a time.
++#[inline]
++fn has_quote(s: &[u8]) -> bool {
++    let mut i = 0;
++    while i + 8 <= s.len() {
++        if eq_mask(word(s, i), b'"') != 0 {
++            return true;
++        }
++        i += 8;
++    }
++    s[i..].contains(&b'"')
++}
++
+ /// Split one line into exactly `N` fields. Returns `false` when the line is malformed.
++/// A line without any quote (nearly all of them) is cut at its commas 8 bytes at a time; any line with a
++/// quote takes the field-by-field path, which is the reference.
+ #[inline]
+ pub fn split_line<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]>; N]) -> bool {
++    if line.is_empty() {
++        return false;
++    }
++    if has_quote(line) {
++        return split_line_ref(line, out);
++    }
++    let mut n = 0;
++    let mut start = 0;
++    let mut i = 0;
++    let mut push = |a: usize, b: usize, n: &mut usize| -> bool {
++        if *n == N {
++            return false;
++        }
++        out[*n] = if a == b { None } else { Some(&line[a..b]) };
++        *n += 1;
++        true
++    };
++    while i + 8 <= line.len() {
++        let mut m = eq_mask(word(line, i), b',');
++        while m != 0 {
++            let p = i + (m.trailing_zeros() / 8) as usize;
++            if !push(start, p, &mut n) {
++                return false;
++            }
++            start = p + 1;
++            m &= m - 1;
++        }
++        i += 8;
++    }
++    for (k, &b) in line[i..].iter().enumerate() {
++        if b == b',' {
++            let p = i + k;
++            if !push(start, p, &mut n) {
++                return false;
++            }
++            start = p + 1;
++        }
++    }
++    push(start, line.len(), &mut n) && n == N
++}
++
++/// The reference splitter: field by field, quotes checked per field.
++#[inline]
++pub fn split_line_ref<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]>; N]) -> bool {
+     if line.is_empty() {
+         return false;
+     }
+@@ -87,7 +161,32 @@ pub fn chunks(data: &[u8], target: usize) -> Vec<&[u8]> {
+ /// The lines of a piece (split on `\n` only; empty lines are skipped, as they are malformed anyway).
+ #[inline]
+ pub fn lines(piece: &[u8]) -> impl Iterator<Item = &[u8]> {
+-    piece.split(|&b| b == b'\n').filter(|l| !l.is_empty())
++    let mut pos = 0;
++    std::iter::from_fn(move || {
++        while pos < piece.len() {
++            let start = pos;
++            let end = find_newline(piece, start);
++            pos = end + 1;
++            if end > start {
++                return Some(&piece[start..end]);
++            }
++        }
++        None
++    })
++}
++
++/// Index of the first `\n` at or after `from`, or `s.len()`.
++#[inline]
++fn find_newline(s: &[u8], from: usize) -> usize {
++    let mut i = from;
++    while i + 8 <= s.len() {
++        let m = eq_mask(word(s, i), b'\n');
++        if m != 0 {
++            return i + (m.trailing_zeros() / 8) as usize;
++        }
++        i += 8;
++    }
++    s[i..].iter().position(|&b| b == b'\n').map_or(s.len(), |p| i + p)
+ }
+ 
+ #[cfg(test)]
+@@ -105,6 +204,42 @@ mod tests {
+         assert!(split_line(b"\"\",  ,", &mut o));
+         assert_eq!(o, [None, Some(&b"  "[..]), None]);
+     }
++    /// The fast splitter and line cutter against the reference on random lines over an awkward alphabet.
++    #[test]
++    fn fast_paths_equal_reference() {
++        let alphabet = b"a,\"\r b\t,,";
++        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
++        let mut rnd = || {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed
++        };
++        for _ in 0..300_000 {
++            let len = (rnd() % 40) as usize;
++            let line: Vec<u8> = (0..len).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect();
++            let (mut a, mut b) = ([None; 4], [None; 4]);
++            let (fa, fb) = (split_line(&line, &mut a), split_line_ref(&line, &mut b));
++            assert_eq!(fa, fb, "{:?}", String::from_utf8_lossy(&line));
++            if fa {
++                assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&line));
++            }
++            let (mut a, mut b) = ([None; 1], [None; 1]);
++            let (fa, fb) = (split_line(&line, &mut a), split_line_ref(&line, &mut b));
++            assert_eq!(fa, fb);
++            if fa {
++                assert_eq!(a, b);
++            }
++        }
++        for _ in 0..20_000 {
++            let len = (rnd() % 200) as usize;
++            let piece: Vec<u8> = (0..len).map(|_| b"ab\n\n,\r"[(rnd() % 6) as usize]).collect();
++            let fast: Vec<&[u8]> = lines(&piece).collect();
++            let reference: Vec<&[u8]> = piece.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
++            assert_eq!(fast, reference);
++        }
++    }
++
+     #[test]
+     fn chunking() {
+         let d = b"h1,h2\na,b\nc,d\ne,f";
