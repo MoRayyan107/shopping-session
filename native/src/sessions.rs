@@ -8,7 +8,7 @@ use crate::key::Key;
 pub const GAP_MS: i64 = 1_800_000;
 pub const DAY_MS: i64 = 86_400_000;
 
-/// One session (48 bytes).
+/// One session (40 bytes).
 #[derive(Clone, Copy)]
 pub struct Session {
     pub person: Key,
@@ -88,8 +88,8 @@ mod tests {
 
     #[test]
     fn session_size() {
-        assert_eq!(std::mem::size_of::<Session>(), 48);
-        assert_eq!(std::mem::size_of::<Event>(), 40);
+        assert_eq!(std::mem::size_of::<Session>(), 40);
+        assert_eq!(std::mem::size_of::<Event>(), 32);
     }
 
     #[test]

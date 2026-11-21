@@ -72,7 +72,7 @@ fn pack_pk(price: u32, kind: u8) -> u32 {
     ((kind as u32) << 24) | price
 }
 
-/// One valid event, mapped to its person (40 bytes). `line` is its raw line (used for dumps). `cat` is only
+/// One valid event, mapped to its person (32 bytes). `line` is its raw line (used for dumps). `cat` is only
 /// set for purchases.
 #[derive(Clone, Copy)]
 pub struct Event {
@@ -105,7 +105,7 @@ impl Event {
     }
 }
 
-/// One well-formed line with a non-empty event_id, validated (64 bytes). Type INVALID when the copy fails.
+/// One well-formed line with a non-empty event_id, validated (48 bytes). Type INVALID when the copy fails.
 #[derive(Clone, Copy)]
 pub struct Rec {
     /// the event_id's exact key (its hash picks the dedup bucket)
@@ -301,8 +301,8 @@ mod tests {
     use super::*;
     #[test]
     fn record_sizes() {
-        assert_eq!(std::mem::size_of::<Rec>(), 64);
-        assert_eq!(std::mem::size_of::<Event>(), 40);
+        assert_eq!(std::mem::size_of::<Rec>(), 48);
+        assert_eq!(std::mem::size_of::<Event>(), 32);
     }
     #[test]
     fn f1_ingest_only() {

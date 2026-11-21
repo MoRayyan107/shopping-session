@@ -1,68 +1,108 @@
-//! 16-byte exact keys for IDs (user IDs and the persons they map to), so comparing two IDs never reads the
-//! input files again.
+//! 8-byte exact keys for IDs (user IDs and the persons they map to, event and click IDs), so comparing two
+//! IDs never reads the input files again.
 //!
-//! An ID of at most 15 bytes is stored inline: its bytes, zero-padded, in the top 15 bytes (big-endian) and
-//! its length in the lowest byte. Two inline keys are equal exactly when the IDs are equal, and they order
-//! exactly as the IDs do byte-wise (zero padding plus the length orders a prefix first).
-//! A longer ID is a *canonical* span: the first span registered for those bytes (`Store::key`), with 0xFF in
-//! the lowest byte, so equal long IDs also have equal keys. Equal keys <=> equal IDs, for every ID.
-//! Long keys order by span (any fixed order is fine: only grouping needs it, never the output).
-use crate::span::{Span, Store};
+//! A *compact* key holds an ID of at most COMPACT_MAX (10) bytes, all in `0-9A-Za-z`: each byte becomes a
+//! 6-bit code (1..=62, increasing with the byte value), packed most significant first into bits 59..0 and
+//! padded on the right with code 0. Two compact keys are equal exactly when the IDs are equal, and they order
+//! exactly as the IDs do byte-wise (the padding code is below every byte's code, so a prefix orders first).
+//! Bit 63 is clear.
+//! Any other ID gets a *long* key: bit 63 set and the ID's index in the store's registry of long IDs, given
+//! to the first occurrence of those bytes (`Store::key`), so equal long IDs also have equal keys.
+//! Whether an ID is compact depends only on its bytes, so equal keys <=> equal IDs, for every ID.
+//! Long keys order by registry index (any fixed order is fine: only grouping needs it, never the output;
+//! byte order of mixed keys is read back, see `is_inline`).
+use crate::span::Store;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
-pub struct Key {
-    hi: u64,
-    lo: u64,
-}
+pub struct Key(u64);
 
-pub const INLINE_MAX: usize = 15;
-const LONG: u64 = 0xFF;
+/// The longest ID a compact key holds.
+pub const INLINE_MAX: usize = 10;
+const LONG: u64 = 1 << 63;
+/// Marks a byte that has no compact code (any byte outside `0-9A-Za-z`).
+const BAD: u8 = 0xFF;
 
-#[inline(always)]
-fn be_prefix(b: &[u8]) -> u64 {
-    // the first min(len, 8) bytes, big-endian, zero-padded on the right
-    if b.len() >= 8 {
-        return u64::from_be_bytes(b[..8].try_into().unwrap());
+/// The 6-bit code of every byte: `0-9` -> 1..=10, `A-Z` -> 11..=36, `a-z` -> 37..=62, others BAD.
+const CODE: [u8; 256] = {
+    let mut t = [BAD; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = 1 + i as u8;
+        i += 1;
     }
-    let mut v = 0u64;
-    for (i, &x) in b.iter().enumerate() {
-        v |= (x as u64) << (56 - 8 * i);
+    let mut i = 0;
+    while i < 26 {
+        t[b'A' as usize + i] = 11 + i as u8;
+        t[b'a' as usize + i] = 37 + i as u8;
+        i += 1;
     }
-    v
-}
+    t
+};
+
+/// The byte of every code (index 0, the padding, is never decoded).
+const BYTE: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut c = 0;
+    while c < 256 {
+        if CODE[c] != BAD {
+            t[CODE[c] as usize] = c as u8;
+        }
+        c += 1;
+    }
+    t
+};
 
 impl Key {
-    /// The inline key of an ID of at most INLINE_MAX bytes.
+    /// The compact key of `b`, or None when it is longer than `max` (at most INLINE_MAX) or holds a byte
+    /// outside `0-9A-Za-z`.
     #[inline(always)]
+    pub fn compact(b: &[u8], max: usize) -> Option<Key> {
+        debug_assert!(max <= INLINE_MAX);
+        if b.len() > max {
+            return None;
+        }
+        let mut v = 0u64;
+        let mut bad = 0u8;
+        for &c in b {
+            let k = CODE[c as usize];
+            bad |= k;
+            v = (v << 6) | (k & 63) as u64;
+        }
+        // valid codes are below 64, so bit 7 is set only by a BAD byte
+        if bad & 0x80 != 0 {
+            return None;
+        }
+        Some(Key(v << (6 * (INLINE_MAX - b.len()))))
+    }
+
+    /// The compact key of an ID known to be compact (tests and constants).
     pub fn inline(b: &[u8]) -> Key {
-        let n = b.len();
-        debug_assert!(n <= INLINE_MAX);
-        let hi = be_prefix(b);
-        let lo = if n > 8 {
-            // bytes 8..n: the last n - 8 bytes of the (overlapping) final 8-byte word, moved to the top
-            let tail = u64::from_be_bytes(b[n - 8..n].try_into().unwrap());
-            tail << (8 * (16 - n))
-        } else {
-            0
-        };
-        Key { hi, lo: lo | n as u64 }
+        Key::compact(b, INLINE_MAX).expect("a compact ID")
     }
 
-    /// The key of a long ID, from its canonical span (only `Store::key` calls this).
+    /// The key of the long ID with registry index `idx` (only `Store::key` calls this).
     #[inline]
-    pub fn long(canonical: Span) -> Key {
-        Key { hi: canonical.raw(), lo: LONG }
+    pub fn long(idx: u64) -> Key {
+        debug_assert!(idx < LONG);
+        Key(LONG | idx)
     }
 
+    /// The registry index of a long key.
+    #[inline]
+    pub fn long_index(self) -> u64 {
+        self.0 & !LONG
+    }
+
+    /// True for a compact key (compact keys order exactly as their IDs' bytes).
     #[inline(always)]
     pub fn is_inline(self) -> bool {
-        self.lo & 0xFF != LONG
+        self.0 & LONG == 0
     }
 
-    /// A well-mixed 64-bit hash (the top bits pick the bucket), a function of the ID's bytes only.
+    /// A well-mixed 64-bit hash (the top bits pick the bucket), a function of the key only.
     #[inline(always)]
     pub fn hash(self) -> u64 {
-        let mut x = self.hi ^ self.lo.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        let mut x = self.0 ^ 0x9E37_79B9_7F4A_7C15;
         x ^= x >> 33;
         x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
         x ^= x >> 33;
@@ -74,13 +114,17 @@ impl Key {
     /// The ID's bytes.
     pub fn to_vec(self, store: &Store<'_>) -> Vec<u8> {
         if self.is_inline() {
-            let n = (self.lo & 0xFF) as usize;
-            let mut buf = [0u8; 16];
-            buf[..8].copy_from_slice(&self.hi.to_be_bytes());
-            buf[8..].copy_from_slice(&self.lo.to_be_bytes());
-            buf[..n].to_vec()
+            let mut out = Vec::with_capacity(INLINE_MAX);
+            for i in 0..INLINE_MAX {
+                let c = (self.0 >> (6 * (INLINE_MAX - 1 - i))) & 63;
+                if c == 0 {
+                    break;
+                }
+                out.push(BYTE[c as usize]);
+            }
+            out
         } else {
-            store.get(Span::from_raw(self.hi)).to_vec()
+            store.long_bytes(self.long_index()).to_vec()
         }
     }
 }
@@ -89,7 +133,7 @@ impl Key {
 mod tests {
     use super::*;
 
-    fn all_short_ids(alphabet: &[u8], max: usize) -> Vec<Vec<u8>> {
+    fn all_ids(alphabet: &[u8], max: usize) -> Vec<Vec<u8>> {
         let mut out = vec![Vec::new()];
         let mut layer = vec![Vec::new()];
         for _ in 0..max {
@@ -108,9 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn inline_keys_are_exact_and_byte_ordered() {
-        // every ID up to 3 bytes over an alphabet with 0x00, 0xFF and ordinary bytes
-        let ids = all_short_ids(&[0x00, b'a', b'b', 0xFF], 3);
+    fn codes_increase_with_the_byte() {
+        let valid: Vec<u8> = (0..=255u8).filter(|&c| CODE[c as usize] != BAD).collect();
+        assert_eq!(valid.len(), 62);
+        assert!(valid.windows(2).all(|w| CODE[w[0] as usize] < CODE[w[1] as usize]));
+        assert!(valid.iter().all(|&c| c.is_ascii_alphanumeric() && BYTE[CODE[c as usize] as usize] == c));
+        assert_eq!(CODE[b'0' as usize], 1);
+        assert_eq!(CODE[b'z' as usize], 62);
+    }
+
+    #[test]
+    fn compact_keys_are_exact_and_byte_ordered() {
+        // every ID up to 3 bytes over the alphabet's edges and middle
+        let ids = all_ids(b"09AMZamz", 3);
         let store = Store::from_slices(vec![], crate::span::MAX_LEN);
         for a in &ids {
             let ka = Key::inline(a);
@@ -122,11 +176,12 @@ mod tests {
                 assert_eq!(ka.cmp(&kb), a.cmp(b), "{a:?} {b:?}");
             }
         }
+        assert_eq!(Key::inline(b""), Key::default());
     }
 
     #[test]
-    fn inline_keys_of_every_length() {
-        // lengths 0..=15 with random bytes, including prefixes of each other and the 8-byte boundary
+    fn compact_keys_of_every_length_and_the_limits() {
+        // lengths 0..=10 with random alphanumeric bytes, including prefixes of each other
         let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
         let mut rnd = || {
             seed ^= seed << 13;
@@ -134,22 +189,24 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
+        let alpha = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let store = Store::from_slices(vec![], crate::span::MAX_LEN);
         let mut ids: Vec<Vec<u8>> = Vec::new();
-        for _ in 0..3000 {
-            let n = (rnd() % 16) as usize;
-            let v: Vec<u8> = (0..n).map(|_| [0u8, 1, b'x', b'y', 0xFE, 0xFF][(rnd() % 6) as usize]).collect();
-            ids.push(v);
+        for _ in 0..4000 {
+            let n = (rnd() % 11) as usize;
+            // a small alphabet slice makes equal and prefix IDs likely
+            let lo = (rnd() % 60) as usize;
+            ids.push((0..n).map(|_| alpha[lo + (rnd() % 3) as usize]).collect());
         }
-        let base: Vec<u8> = (0..15).map(|i| b'a' + i as u8).collect();
-        for n in 0..=15 {
-            ids.push(base[..n].to_vec());
+        for n in 0..=10 {
+            ids.push(b"zzzzzzzzzz"[..n].to_vec());
+            ids.push(b"0000000000"[..n].to_vec());
         }
         for a in &ids {
             assert_eq!(Key::inline(a).to_vec(&store), *a);
         }
         for a in &ids {
-            for b in ids.iter().take(400) {
+            for b in ids.iter().take(500) {
                 let (ka, kb) = (Key::inline(a), Key::inline(b));
                 assert_eq!(ka == kb, a == b);
                 assert_eq!(ka.cmp(&kb), a.cmp(b), "{a:?} {b:?}");
@@ -158,13 +215,24 @@ mod tests {
                 }
             }
         }
+        // the limits: 11 bytes, or any byte outside 0-9A-Za-z, is not compact; a lower max is honoured
+        assert!(Key::compact(b"abcdefghijk", INLINE_MAX).is_none());
+        for c in 0..=255u8 {
+            let id = [b'u', c, b'1'];
+            assert_eq!(Key::compact(&id, INLINE_MAX).is_some(), c.is_ascii_alphanumeric(), "byte {c}");
+        }
+        assert!(Key::compact(b"abcde", 4).is_none());
+        assert!(Key::compact(b"abcd", 4).is_some());
+        // the largest compact key leaves the long bit clear
+        assert!(Key::inline(b"zzzzzzzzzz").is_inline());
     }
 
     #[test]
     fn long_keys_are_canonical() {
-        // the same 20-byte ID in two places, another one, and a 15-byte one; with the inline limit lowered
-        // to 4, the 9-byte IDs take the long path too
-        let d = b"abcdefghijklmnopqrst,abcdefghijklmnopqrst,abcdefghijklmnopqrsu,abcdefghijklmno,u12345678,u12345678".to_vec();
+        // the same 20-byte ID in two places, another one, a 15-byte one, IDs with bytes outside the alphabet;
+        // with the limit lowered to 4, the 9-byte IDs take the long path too
+        let d = b"abcdefghijklmnopqrst,abcdefghijklmnopqrst,abcdefghijklmnopqrsu,abcdefghijklmno,u12345678,u12345678,u_1,u_1,u\xff,u\x00"
+            .to_vec();
         for limit in [INLINE_MAX, 4] {
             let store = Store::from_slices_with_inline(vec![&d], crate::span::MAX_LEN, limit);
             let f: Vec<&[u8]> = d.split(|&b| b == b',').collect();
@@ -173,24 +241,35 @@ mod tests {
             assert_ne!(k[0], k[2]);
             assert_ne!(k[0], k[3]);
             assert_eq!(k[4], k[5]);
+            assert_eq!(k[6], k[7]);
+            assert_ne!(k[6], k[8]);
+            assert_ne!(k[8], k[9]);
             assert_eq!(k[0].hash(), k[1].hash());
             assert!(!k[0].is_inline());
-            assert_eq!(k[3].is_inline(), limit == INLINE_MAX);
+            assert!(!k[3].is_inline());
+            assert!(!k[6].is_inline() && !k[8].is_inline() && !k[9].is_inline());
             assert_eq!(k[4].is_inline(), limit == INLINE_MAX);
             for (s, key) in f.iter().zip(&k) {
                 assert_eq!(key.to_vec(&store), s.to_vec());
             }
-            // a long key never equals an inline one, even of the same bytes
-            if limit < f[3].len() {
-                assert_ne!(store.key(0, f[3]), Key::inline(f[3]));
+            // a long key never equals a compact one
+            if limit < f[4].len() {
+                assert_ne!(store.key(0, f[4]), Key::inline(f[4]));
             }
             assert_eq!(store.key_of(f[1]), k[0]);
+            assert_eq!(store.key_of(f[7]), k[6]);
+            // every pair: equal keys <=> equal bytes
+            for (a, ka) in f.iter().zip(&k) {
+                for (b, kb) in f.iter().zip(&k) {
+                    assert_eq!(ka == kb, a == b, "{a:?} {b:?}");
+                }
+            }
         }
     }
 
     #[test]
     fn key_size() {
-        assert_eq!(std::mem::size_of::<Key>(), 16);
+        assert_eq!(std::mem::size_of::<Key>(), 8);
         assert_eq!(std::mem::align_of::<Key>(), 8);
     }
 }

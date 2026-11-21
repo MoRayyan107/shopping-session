@@ -50,7 +50,7 @@ impl<'a> Campaigns<'a> {
     }
 }
 
-/// One valid click, mapped to its person (48 bytes).
+/// One valid click, mapped to its person (32 bytes).
 #[derive(Clone, Copy)]
 pub struct Click {
     /// the person's exact key; its bucket is the top bits of `person.hash()`
@@ -82,7 +82,7 @@ pub struct Credit {
 
 const VALID: u32 = 1 << 31;
 
-/// One well-formed line with a non-empty click_id, validated (56 bytes).
+/// One well-formed line with a non-empty click_id, validated (40 bytes).
 #[derive(Clone, Copy)]
 pub struct Rec {
     /// the click_id's exact key (its hash picks the dedup bucket)
@@ -292,8 +292,8 @@ mod tests {
     use super::*;
     #[test]
     fn record_sizes() {
-        assert_eq!(std::mem::size_of::<Rec>(), 56);
-        assert_eq!(std::mem::size_of::<Click>(), 48);
+        assert_eq!(std::mem::size_of::<Rec>(), 40);
+        assert_eq!(std::mem::size_of::<Click>(), 32);
     }
     #[test]
     fn click_id_order_is_byte_order() {

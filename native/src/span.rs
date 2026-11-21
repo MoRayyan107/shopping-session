@@ -69,9 +69,18 @@ pub struct Store<'a> {
     /// IDs up to this many bytes get inline keys (`key::INLINE_MAX`, lowered by NATIVE_KEY_INLINE_MAX to test
     /// the long path)
     inline_max: usize,
-    /// canonical span of every long ID seen, sharded by hash
-    long: Vec<std::sync::Mutex<FxMap<&'a [u8], Span>>>,
+    /// every long ID seen, sharded by hash: bytes -> registry index, and each shard's IDs by local index
+    long: Vec<std::sync::Mutex<LongShard<'a>>>,
 }
+
+#[derive(Default)]
+struct LongShard<'a> {
+    index: FxMap<&'a [u8], u64>,
+    ids: Vec<&'a [u8]>,
+}
+
+/// A long key's registry index: the shard in the top bits, the shard's local index below.
+const LONG_LOCAL_BITS: u32 = 48;
 
 impl<'a> Store<'a> {
     /// All files of all inputs, numbered in order; `first(k)` is the index of input k's first file.
@@ -102,38 +111,48 @@ impl<'a> Store<'a> {
             .map(|(i, f)| (f.as_ptr() as usize, f.as_ptr() as usize + f.len(), i as u32))
             .collect();
         by_addr.sort_unstable();
-        let long = (0..LONG_SHARDS).map(|_| std::sync::Mutex::new(FxMap::default())).collect();
+        let long = (0..LONG_SHARDS).map(|_| std::sync::Mutex::new(LongShard::default())).collect();
         Store { files, by_addr, side: RwLock::new(Vec::new()), max_len, inline_max: inline_max.min(INLINE_MAX), long }
     }
 
-    /// The exact key of ID `s`, which lies inside file `file`: inline when short, else its canonical span
-    /// (the first span registered for these bytes).
+    /// The exact key of ID `s` (inside file `file`; any slice that lives as long as the store will do):
+    /// compact when it can be, else its long key (the registry index of the first occurrence of these bytes).
     #[inline]
-    pub fn key(&self, file: u32, s: &'a [u8]) -> Key {
-        if s.len() <= self.inline_max {
-            return Key::inline(s);
+    pub fn key(&self, _file: u32, s: &'a [u8]) -> Key {
+        match Key::compact(s, self.inline_max) {
+            Some(k) => k,
+            None => self.long_key(s),
         }
-        self.long_key(s, || self.span(file, s))
     }
 
-    /// Like `key`, for a slice inside any of the files (found by address).
+    /// Like `key`, for a slice inside any of the files.
     pub fn key_of(&self, s: &'a [u8]) -> Key {
-        if s.len() <= self.inline_max {
-            return Key::inline(s);
-        }
-        self.long_key(s, || self.span_of(s))
+        self.key(0, s)
     }
 
     #[cold]
-    fn long_key(&self, s: &'a [u8], span: impl FnOnce() -> Span) -> Key {
+    fn long_key(&self, s: &'a [u8]) -> Key {
         let shard = (hash_bytes(s) >> 58) as usize % LONG_SHARDS;
         let mut m = self.long[shard].lock().unwrap();
-        Key::long(*m.entry(s).or_insert_with(span))
+        let LongShard { index, ids } = &mut *m;
+        let idx = *index.entry(s).or_insert_with(|| {
+            ids.push(s);
+            assert!(ids.len() < 1 << LONG_LOCAL_BITS, "long ID registry full");
+            ((shard as u64) << LONG_LOCAL_BITS) | (ids.len() - 1) as u64
+        });
+        Key::long(idx)
+    }
+
+    /// The bytes of the long ID with registry index `idx`.
+    #[cold]
+    pub fn long_bytes(&self, idx: u64) -> &'a [u8] {
+        let shard = (idx >> LONG_LOCAL_BITS) as usize;
+        self.long[shard].lock().unwrap().ids[(idx & ((1 << LONG_LOCAL_BITS) - 1)) as usize]
     }
 
     /// Distinct long IDs registered (logged).
     pub fn long_ids(&self) -> usize {
-        self.long.iter().map(|m| m.lock().unwrap().len()).sum()
+        self.long.iter().map(|m| m.lock().unwrap().ids.len()).sum()
     }
 
     /// The span of `s`, which lies inside file `file`.

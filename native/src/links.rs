@@ -10,7 +10,7 @@ use crate::raw::Row;
 use crate::span::Store;
 use crate::util::{partition, FxMap};
 
-/// One renamed ID (32 bytes); `id == Key::default()` (the empty ID, never renamed) marks an empty slot.
+/// One renamed ID (16 bytes); `id == Key::default()` (the empty ID, never renamed) marks an empty slot.
 #[derive(Clone, Copy, Default)]
 struct Slot {
     id: Key,
