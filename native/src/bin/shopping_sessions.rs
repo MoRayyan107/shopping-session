@@ -237,18 +237,19 @@ fn main() {
 
     // Stage 6: clicks, credit, assists
     let camps = clicks::Campaigns::new(&campaigns);
+    let cells = clicks::Cells::new(camps.names.len(), ws, we);
     let ck = clicks::build(&ck_files, first[1], &store, &ptab, &camps, ws, we);
     taken_all();
     eprintln!("long IDs (over the inline limit): {}", store.long_ids());
     drop(ptab);
     clock.lap("clicks dedup + validate + person", ck.iter().map(Vec::len).sum::<usize>());
-    let cr = clicks::credit(&parts, &ck, &camps, dump.wants("session_assist"));
+    let cr = clicks::credit(&parts, &ck, &camps, &cells, dump.wants("session_assist"));
     clock.lap(
         "credit + assists",
         format!(
             "{} credited, {} assists",
             cr.iter().map(|c| c.credit.iter().filter(|&&x| x != camps.organic).count()).sum::<usize>(),
-            cr.iter().map(|c| c.assist_counts.values().sum::<i64>()).sum::<i64>()
+            cr.iter().map(|c| c.assist_counts.total()).sum::<i64>()
         ),
     );
     if dump.on() {
@@ -314,7 +315,7 @@ fn main() {
     }
 
     // Stage 7: campaign_daily, self-checks, Parquet output
-    let cd = daily::campaign_daily(&parts, &cr, &camps);
+    let cd = daily::campaign_daily(&parts, &cr, &camps, &cells);
     clock.lap("campaign_daily", cd.len());
     let n_sessions: i64 = parts.iter().map(|p| p.sessions.len() as i64).sum();
     let ud_sessions: i64 = ud.iter().flatten().map(|r| r.sessions).sum();

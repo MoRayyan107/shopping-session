@@ -76,8 +76,74 @@ pub struct Credit {
     pub credit: Vec<u32>,
     /// (session index in the part, campaign), distinct per session; only filled when `keep_assists`
     pub assists: Vec<(u32, u32)>,
-    /// assisted sessions per key(campaign, day)
-    pub assist_counts: FxMap<u64, i64>,
+    /// assisted sessions per (campaign, day)
+    pub assist_counts: Counts,
+}
+
+/// The (campaign, day) cells of campaign_daily: every session's day lies in [day0, day0 + ndays) (sessions
+/// start inside the window). Counted in dense arrays (cell = camp * ndays + day - day0) when the cells are
+/// few (NATIVE_DENSE_MAX_CELLS, default 2^17; 0 forces the maps), else in hash maps keyed by `key`.
+#[derive(Clone, Copy)]
+pub struct Cells {
+    pub day0: i32,
+    pub ndays: usize,
+    pub ncamp: usize,
+    pub dense: bool,
+}
+
+impl Cells {
+    pub fn new(ncamp: usize, ws: i64, we: i64) -> Cells {
+        let day0 = crate::sessions::day_of(ws);
+        let ndays = (crate::sessions::day_of(we.max(ws + 1) - 1) - day0 + 1).max(1) as usize;
+        let max = std::env::var("NATIVE_DENSE_MAX_CELLS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1 << 17);
+        Cells { day0, ndays, ncamp, dense: ncamp.saturating_mul(ndays) <= max }
+    }
+    pub fn len(&self) -> usize {
+        self.ncamp * self.ndays
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The dense index of (camp, day).
+    #[inline(always)]
+    pub fn cell(&self, camp: u32, day: i32) -> usize {
+        let d = (day - self.day0) as usize;
+        assert!(d < self.ndays, "session day {day} outside the window's days");
+        camp as usize * self.ndays + d
+    }
+    /// (camp, day) of a dense index.
+    pub fn of(&self, cell: usize) -> (u32, i32) {
+        ((cell / self.ndays) as u32, self.day0 + (cell % self.ndays) as i32)
+    }
+}
+
+/// Assisted-session counts per (campaign, day) of one part.
+pub enum Counts {
+    Dense(Vec<u32>),
+    Map(FxMap<u64, i64>),
+}
+
+impl Counts {
+    pub fn new(cells: &Cells) -> Counts {
+        if cells.dense {
+            Counts::Dense(vec![0; cells.len()])
+        } else {
+            Counts::Map(FxMap::default())
+        }
+    }
+    #[inline(always)]
+    fn add(&mut self, cells: &Cells, camp: u32, day: i32) {
+        match self {
+            Counts::Dense(v) => v[cells.cell(camp, day)] += 1,
+            Counts::Map(m) => *m.entry(key(camp, day)).or_insert(0) += 1,
+        }
+    }
+    pub fn total(&self) -> i64 {
+        match self {
+            Counts::Dense(v) => v.iter().map(|&n| n as i64).sum(),
+            Counts::Map(m) => m.values().sum(),
+        }
+    }
 }
 
 const VALID: u32 = 1 << 31;
@@ -227,7 +293,7 @@ pub fn build<'a>(
 
 /// Credit and assists for every session, part by part. Sessions and clicks of a part are both ordered by
 /// person key, so one forward walk finds each person's clicks.
-pub fn credit(parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, keep_assists: bool) -> Vec<Credit> {
+pub fn credit(parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, cells: &Cells, keep_assists: bool) -> Vec<Credit> {
     assert_eq!(clicks.len(), parts.len());
     let ncamp = camps.names.len();
     parts
@@ -237,7 +303,7 @@ pub fn credit(parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, keep
             let mut out = Credit {
                 credit: Vec::with_capacity(p.sessions.len()),
                 assists: Vec::new(),
-                assist_counts: FxMap::default(),
+                assist_counts: Counts::new(cells),
             };
             // stamp[c] == session number + 1 when campaign c already assists the current session
             let mut stamp = vec![0u32; ncamp];
@@ -274,7 +340,7 @@ pub fn credit(parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, keep
                 for c in &pc[lo..k] {
                     if stamp[c.camp as usize] != tag {
                         stamp[c.camp as usize] = tag;
-                        *out.assist_counts.entry(key(c.camp, s.day)).or_insert(0) += 1;
+                        out.assist_counts.add(cells, c.camp, s.day);
                         if keep_assists {
                             out.assists.push((si as u32, c.camp));
                         }

@@ -1,7 +1,7 @@
 //! Stages 5 and 7: the output tables (rules.md "Outputs"). Mirrors `pipeline/outputs.py`.
 use rayon::prelude::*;
 
-use crate::clicks::{key, Campaigns, Credit};
+use crate::clicks::{key, Campaigns, Cells, Counts, Credit};
 use crate::events::{Categories, PURCHASE};
 use crate::pq::{write_table, Col, USER_DAILY};
 use crate::key::Key;
@@ -84,7 +84,10 @@ pub struct CampaignDay<'a> {
 }
 
 /// One row per (campaign, day) that was credited or assisted; organic is the campaign "organic".
-pub fn campaign_daily<'a>(parts: &[Part], credit: &[Credit], camps: &Campaigns<'a>) -> Vec<CampaignDay<'a>> {
+pub fn campaign_daily<'a>(parts: &[Part], credit: &[Credit], camps: &Campaigns<'a>, cells: &Cells) -> Vec<CampaignDay<'a>> {
+    if cells.dense {
+        return campaign_daily_dense(parts, credit, camps, cells);
+    }
     let partial: Vec<FxMap<u64, [i64; 4]>> = parts
         .par_iter()
         .zip(credit.par_iter())
@@ -96,7 +99,8 @@ pub fn campaign_daily<'a>(parts: &[Part], credit: &[Credit], camps: &Campaigns<'
                 v[1] += s.has_purchase as i64;
                 v[2] += s.revenue;
             }
-            for (k, n) in &c.assist_counts {
+            let Counts::Map(counts) = &c.assist_counts else { unreachable!("map cells give map counts") };
+            for (k, n) in counts {
                 m.entry(*k).or_insert([0; 4])[3] += n;
             }
             m
@@ -118,6 +122,60 @@ pub fn campaign_daily<'a>(parts: &[Part], credit: &[Credit], camps: &Campaigns<'
                 campaign: camps.names[camp],
                 channel: camps.channels[camp],
                 day: k as u32 as i32,
+                sessions: v[0],
+                purchasing: v[1],
+                revenue: v[2],
+                assisted: v[3],
+            }
+        })
+        .collect()
+}
+
+/// campaign_daily with dense (campaign, day) cells: each thread sums its parts into one array (at most 8
+/// arrays: parts are taken 32 at a time), the arrays are added, and every cell with a credited or assisted
+/// session is a row (exactly the keys the map version would hold).
+fn campaign_daily_dense<'a>(parts: &[Part], credit: &[Credit], camps: &Campaigns<'a>, cells: &Cells) -> Vec<CampaignDay<'a>> {
+    let n = cells.len();
+    let tot: Vec<[i64; 4]> = parts
+        .par_iter()
+        .zip(credit.par_iter())
+        .with_min_len(32)
+        .fold(
+            || vec![[0i64; 4]; n],
+            |mut acc, (p, c)| {
+                for (s, &k) in p.sessions.iter().zip(&c.credit) {
+                    let v = &mut acc[cells.cell(k, s.day)];
+                    v[0] += 1;
+                    v[1] += s.has_purchase as i64;
+                    v[2] += s.revenue;
+                }
+                let Counts::Dense(counts) = &c.assist_counts else { unreachable!("dense cells give dense counts") };
+                for (v, &a) in acc.iter_mut().zip(counts) {
+                    v[3] += a as i64;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![[0i64; 4]; n],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    for i in 0..4 {
+                        x[i] += y[i];
+                    }
+                }
+                a
+            },
+        );
+    tot.iter()
+        .enumerate()
+        .filter(|(_, v)| v[0] > 0 || v[3] > 0)
+        .map(|(cell, v)| {
+            let (camp, day) = cells.of(cell);
+            CampaignDay {
+                campaign: camps.names[camp as usize],
+                channel: camps.channels[camp as usize],
+                day,
                 sessions: v[0],
                 purchasing: v[1],
                 revenue: v[2],

@@ -275,6 +275,60 @@ mod tests {
     }
 
     #[test]
+    fn scatter_and_chunks_keep_every_row_of_a_bucket_in_push_order() {
+        // rows (bucket, id) over three scatters, enough to fill many chunks of some buckets
+        let mut scatters: Vec<Scatter<(u8, u32)>> = (0..3).map(|_| Scatter::default()).collect();
+        let mut want: Vec<Vec<(u8, u32)>> = vec![Vec::new(); NPARTS];
+        let mut id = 0u32;
+        for round in 0..3 {
+            for s in scatters.iter_mut() {
+                for i in 0..20_000u32 {
+                    let b = if i % 3 == 0 { 7 } else { ((i * 2654435761u32) >> 24) as usize };
+                    s.push(b, (b as u8, id));
+                    id += 1;
+                }
+            }
+            let _ = round;
+        }
+        // per scatter, push order; scatters are concatenated in order
+        let mut per: Vec<Vec<Vec<(u8, u32)>>> = vec![vec![Vec::new(); NPARTS]; 3];
+        let mut id = 0u32;
+        for _ in 0..3 {
+            for p in per.iter_mut() {
+                for i in 0..20_000u32 {
+                    let b = if i % 3 == 0 { 7 } else { ((i * 2654435761u32) >> 24) as usize };
+                    p[b].push((b as u8, id));
+                    id += 1;
+                }
+            }
+        }
+        for p in &per {
+            for b in 0..NPARTS {
+                want[b].extend_from_slice(&p[b]);
+            }
+        }
+        let ch = Chunks::new(scatters);
+        assert_eq!(ch.len(), 180_000);
+        assert_eq!(ch.to_vec().len(), 180_000);
+        for b in 0..NPARTS {
+            let mut got = Vec::new();
+            ch.take(b, &mut got);
+            assert_eq!(got, want[b], "bucket {b}");
+            assert!(got.iter().all(|r| r.0 as usize == b));
+        }
+        assert!(ch.is_empty(), "every bucket was taken");
+    }
+
+    #[test]
+    fn for_each_in_order_visits_every_item_once() {
+        let items: Vec<u32> = (0..10_000).collect();
+        let states = for_each_in_order(&items, Vec::new, |v: &mut Vec<u32>, &x| v.push(x));
+        let mut all: Vec<u32> = states.into_iter().flatten().collect();
+        all.sort();
+        assert_eq!(all, items);
+    }
+
+    #[test]
     fn partition_keeps_every_index_once_in_order() {
         let n = 200_000;
         let parts = partition(n, |i| if i % 7 == 0 { None } else { Some(hash_bytes(&(i as u64).to_le_bytes())) });
@@ -317,6 +371,117 @@ where
         }
     });
     out.into_iter().map(|c| c.into_inner().expect("every item is done")).collect()
+}
+
+/// `f` over `items` on every pool thread with one state per thread, handing items out strictly in order
+/// (a shared counter, as `map_in_order`); returns every thread's final state (in no particular order).
+pub fn for_each_in_order<T, S, I, F>(items: &[T], init: I, f: F) -> Vec<S>
+where
+    T: Sync,
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &T) + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let states = std::sync::Mutex::new(Vec::new());
+    rayon::scope(|s| {
+        for _ in 0..rayon::current_num_threads() {
+            s.spawn(|_| {
+                let mut state = init();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= items.len() {
+                        break;
+                    }
+                    f(&mut state, &items[i]);
+                }
+                states.lock().unwrap().push(state);
+            });
+        }
+    });
+    states.into_inner().unwrap()
+}
+
+/// About this many bytes per chunk of a `Scatter`.
+const CHUNK_BYTES: usize = 32 << 10;
+
+/// One thread's rows, written straight into per-bucket chunks (0..NPARTS), each chunk a Vec of a fixed
+/// capacity; a full chunk is set aside and a new one started. Rows of a bucket keep their push order.
+pub struct Scatter<T> {
+    cur: Vec<Vec<T>>,
+    full: Vec<Vec<Vec<T>>>,
+}
+
+impl<T> Default for Scatter<T> {
+    fn default() -> Self {
+        Scatter { cur: (0..NPARTS).map(|_| Vec::new()).collect(), full: (0..NPARTS).map(|_| Vec::new()).collect() }
+    }
+}
+
+impl<T> Scatter<T> {
+    #[inline(always)]
+    pub fn push(&mut self, b: usize, x: T) {
+        if self.cur[b].len() == self.cur[b].capacity() {
+            self.next_chunk(b);
+        }
+        self.cur[b].push(x);
+    }
+    #[cold]
+    #[inline(never)]
+    fn next_chunk(&mut self, b: usize) {
+        let rows = (CHUNK_BYTES / std::mem::size_of::<T>().max(1)).max(16);
+        let c = std::mem::replace(&mut self.cur[b], Vec::with_capacity(rows));
+        if !c.is_empty() {
+            self.full[b].push(c);
+        }
+    }
+}
+
+/// The rows of many `Scatter`s by bucket: bucket b is a list of chunks. A bucket can be taken out (and freed
+/// by its user) while the others stay, so each bucket's memory goes as soon as it is used.
+pub struct Chunks<T> {
+    buckets: Vec<std::sync::Mutex<Vec<Vec<T>>>>,
+}
+
+impl<T: Copy + Send> Chunks<T> {
+    pub fn new(scatters: Vec<Scatter<T>>) -> Chunks<T> {
+        let mut buckets: Vec<Vec<Vec<T>>> = (0..NPARTS).map(|_| Vec::new()).collect();
+        for s in scatters {
+            for (b, (full, cur)) in s.full.into_iter().zip(s.cur).enumerate() {
+                buckets[b].extend(full);
+                if !cur.is_empty() {
+                    buckets[b].push(cur);
+                }
+            }
+        }
+        Chunks { buckets: buckets.into_iter().map(std::sync::Mutex::new).collect() }
+    }
+    pub fn len(&self) -> usize {
+        self.buckets.iter().map(|b| b.lock().unwrap().iter().map(Vec::len).sum::<usize>()).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Bucket b taken out of `self` and appended to `out` (exact capacity when `out` is empty); its chunks
+    /// are freed.
+    pub fn take(&self, b: usize, out: &mut Vec<T>) {
+        let chunks = std::mem::take(&mut *self.buckets[b].lock().unwrap());
+        out.reserve_exact(chunks.iter().map(Vec::len).sum());
+        for c in chunks {
+            out.extend_from_slice(&c);
+        }
+    }
+    /// Every row still held, bucket by bucket (dumps only).
+    pub fn to_vec(&self) -> Vec<T> {
+        let mut v = Vec::new();
+        for b in &self.buckets {
+            for c in b.lock().unwrap().iter() {
+                v.extend_from_slice(c);
+            }
+        }
+        v
+    }
 }
 
 /// Rows of many blocks, each block ordered by bucket (0..NPARTS) with the start of every bucket, so bucket
