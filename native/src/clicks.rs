@@ -291,12 +291,33 @@ pub fn build<'a>(
         .map(|b| {
             let mut v = Vec::new();
             by_person.take(b, &mut v);
-            v.sort_unstable_by(|a, b| {
-                a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| cmp_click_ids(store, a.click_id, b.click_id))
-            });
+            sort_clicks(&mut v, store);
             v
         })
         .collect()
+}
+
+/// (person, ts) packed so that u128 order is exactly (person, ts) order.
+#[inline(always)]
+fn person_ts(c: &Click) -> u128 {
+    ((c.person.raw() as u128) << 64) | ((c.ts as u64) ^ (1 << 63)) as u128
+}
+
+/// Sort by (person, ts, click_id byte-wise): one packed-key sort, then each run of equal (person, ts) by
+/// click_id (click_ids are distinct after dedup, so the order is total and the sort's stability is moot).
+fn sort_clicks(v: &mut [Click], store: &Store<'_>) {
+    v.sort_unstable_by_key(person_ts);
+    let mut a = 0;
+    while a < v.len() {
+        let mut z = a + 1;
+        while z < v.len() && v[z].person == v[a].person && v[z].ts == v[a].ts {
+            z += 1;
+        }
+        if z - a > 1 {
+            v[a..z].sort_unstable_by(|x, y| cmp_click_ids(store, x.click_id, y.click_id));
+        }
+        a = z;
+    }
 }
 
 /// Credit and assists for every session, part by part. Sessions and clicks of a part are both ordered by
@@ -368,6 +389,32 @@ mod tests {
         assert_eq!(std::mem::size_of::<Rec>(), 40);
         assert_eq!(std::mem::size_of::<Click>(), 32);
     }
+    #[test]
+    fn packed_sort_equals_the_comparator_sort() {
+        // persons and timestamps from tiny sets (many ties, negative ts), click_ids short and long
+        let ids: Vec<String> = (0..400).map(|i| if i % 5 == 0 { format!("{:020}", 999 - i) } else { format!("c{}", 999 - i) }).collect();
+        let d = ids.join(",").into_bytes();
+        let store = Store::from_slices(vec![&d], crate::span::MAX_LEN);
+        let keys: Vec<Key> = d.split(|&b| b == b',').map(|f| store.key(0, f)).collect();
+        let persons = [Key::inline(b"a"), Key::inline(b"b"), Key::inline(b"zz"), Key::default()];
+        let tss = [i64::MIN, -5, 0, 7, i64::MAX];
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut v: Vec<Click> = keys
+            .iter()
+            .map(|&k| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                Click { person: persons[(x % 4) as usize], click_id: k, ts: tss[((x >> 8) % 5) as usize], camp: 0 }
+            })
+            .collect();
+        let mut want = v.clone();
+        want.sort_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| cmp_click_ids(&store, a.click_id, b.click_id)));
+        sort_clicks(&mut v, &store);
+        let tuple = |c: &Click| (c.person, c.ts, c.click_id);
+        assert_eq!(v.iter().map(tuple).collect::<Vec<_>>(), want.iter().map(tuple).collect::<Vec<_>>());
+    }
+
     #[test]
     fn click_id_order_is_byte_order() {
         let d = b"k10,k9,k1,aaaaaaaaaaaaaaaaaaaa1,aaaaaaaaaaaaaaaaaaaa0,k".to_vec();
