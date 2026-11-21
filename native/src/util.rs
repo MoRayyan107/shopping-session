@@ -106,6 +106,60 @@ pub fn dedup_order(n: usize, idhash: impl Fn(usize) -> u64) -> Vec<u64> {
     keys
 }
 
+/// The same answer as `dedup_groups(&dedup_order(n, idhash))`, by hashing instead of sorting: which rows are
+/// alone in their group, and the groups of 2 or more (rows with equal truncated id hash, the same 40 bits
+/// as `dedup_order`'s keys), each group in row order. `table` is scratch, reused across calls.
+/// An open-addressing table of (truncated hash, first row + 1) finds each row's group in one probe sequence;
+/// later rows of a group are only listed, so the table never holds two slots of one group.
+pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>) -> (Vec<bool>, Vec<Vec<usize>>) {
+    assert!(n < (1 << IDX_BITS) - 1, "a dedup bucket holds {n} rows, more than 2^{IDX_BITS} - 2");
+    let mask = (1u64 << IDX_BITS) - 1;
+    let bits = ((2 * n).max(16)).next_power_of_two().trailing_zeros();
+    let cap = 1usize << bits;
+    table.clear();
+    table.resize(cap, 0);
+    // (first row of the group, a later row) for every row whose truncated hash was seen before
+    let mut later: Vec<(u32, u32)> = Vec::new();
+    for i in 0..n {
+        // the same 40 bits as dedup_order: below the bucket bits, above the index bits
+        let h = (idhash(i) << PART_BITS) & !mask;
+        let mut pos = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
+        loop {
+            let s = table[pos];
+            if s == 0 {
+                table[pos] = h | (i as u64 + 1);
+                break;
+            }
+            if s & !mask == h {
+                later.push((((s & mask) - 1) as u32, i as u32));
+                break;
+            }
+            pos = (pos + 1) & (cap - 1);
+        }
+    }
+    let mut alone = vec![true; n];
+    if later.is_empty() {
+        return (alone, Vec::new());
+    }
+    // later rows are listed in row order, so a stable sort by first row keeps each group in row order
+    later.sort_by_key(|p| p.0);
+    let mut groups = Vec::new();
+    let mut a = 0;
+    while a < later.len() {
+        let first = later[a].0;
+        let mut g = vec![first as usize];
+        while a < later.len() && later[a].0 == first {
+            g.push(later[a].1 as usize);
+            a += 1;
+        }
+        for &k in &g {
+            alone[k] = false;
+        }
+        groups.push(g);
+    }
+    (alone, groups)
+}
+
 /// From `order` (dedup_order of n rows): which rows are alone in their group, and the groups of 2 or more.
 pub fn dedup_groups(order: &[u64]) -> (Vec<bool>, Vec<Vec<usize>>) {
     let mask = (1u64 << IDX_BITS) - 1;
@@ -147,6 +201,49 @@ mod tests {
         // bits below 16 and the top 8 bits are not part of the key, so 1 and 4 form a group too
         assert_eq!(groups, vec![vec![0, 2, 5], vec![1, 4]]);
         assert_eq!(alone, vec![false, false, false, true, false, false]);
+    }
+
+    /// dedup_find gives exactly dedup_groups(dedup_order(..)): the same alone flags and the same groups,
+    /// each in row order (groups compared as a sorted list).
+    fn same_as_sorting(h: &[u64], table: &mut Vec<u64>) {
+        let (alone_s, mut groups_s) = dedup_groups(&dedup_order(h.len(), |i| h[i]));
+        let (alone_f, mut groups_f) = dedup_find(h.len(), |i| h[i], table);
+        assert_eq!(alone_s, alone_f);
+        for g in &groups_f {
+            assert!(g.windows(2).all(|w| w[0] < w[1]), "a group in row order");
+        }
+        groups_s.sort();
+        groups_f.sort();
+        assert_eq!(groups_s, groups_f);
+    }
+
+    #[test]
+    fn dedup_find_equals_sorting() {
+        let mut table = Vec::new();
+        // the forced collisions of the test above, and the empty case
+        same_as_sorting(&[0xAAu64 << 20, 1 << 60, 0xAA << 20, 0x55 << 20, (1 << 60) | 0xFFFF, 0xAA << 20], &mut table);
+        same_as_sorting(&[], &mut table);
+        same_as_sorting(&[7], &mut table);
+        // random hashes drawn from small pools: many groups, groups of every size, bits that are dropped
+        // (top 8 bits, low 16 bits) varying inside a group, and long probe runs in a full table
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for &(n, pool) in &[(10usize, 3u64), (1000, 900), (5000, 100), (20000, 19000), (50000, 50000), (3000, 1)] {
+            let base: Vec<u64> = (0..pool).map(|_| rnd()).collect();
+            let h: Vec<u64> = (0..n)
+                .map(|_| {
+                    let b = base[(rnd() % pool) as usize];
+                    // vary the bits outside the 40 compared ones
+                    (b & 0x00FF_FFFF_FFFF_0000) | (rnd() & 0xFF00_0000_0000_FFFF)
+                })
+                .collect();
+            same_as_sorting(&h, &mut table);
+        }
     }
 
     #[test]

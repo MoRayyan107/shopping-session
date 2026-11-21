@@ -11,7 +11,7 @@ use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::sessions::Part;
 use crate::span::{Span, Store};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, map_in_order, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_find, map_in_order, sort_by_bucket, Buckets, FxMap, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -156,19 +156,18 @@ pub fn build<'a>(
     let out: Vec<(Vec<Click>, Vec<u32>)> = (0..nparts)
         .into_par_iter()
         .map_init(
-            || (Vec::new(), Vec::new()),
-            |(recs, clicks): &mut (Vec<Rec>, Vec<Click>), b| {
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |(recs, clicks, table): &mut (Vec<Rec>, Vec<Click>, Vec<u64>), b| {
                 recs.clear();
                 clicks.clear();
                 by_id.gather(b, recs);
-                let order = dedup_order(recs.len(), |i| recs[i].id.hash());
                 let emit = |r: &Rec, clicks: &mut Vec<Click>| {
                     if r.camp_valid & VALID != 0 {
                         let person = ptab.lookup(r.user);
                         clicks.push(Click { person, click_id: r.id, camp: r.camp_valid & !VALID, ts: r.ts });
                     }
                 };
-                let (alone, groups) = dedup_groups(&order);
+                let (alone, groups) = dedup_find(recs.len(), |i| recs[i].id.hash(), table);
                 // unique ids in memory order (sequential reads), then the groups of copies
                 for (i, r) in recs.iter().enumerate() {
                     if alone[i] {

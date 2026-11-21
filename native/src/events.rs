@@ -16,7 +16,7 @@ use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
 use crate::ts::{parse_price, parse_ts};
-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_find, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
 
 pub const VIEW: u8 = 0;
 pub const CART: u8 = 1;
@@ -229,12 +229,11 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
     let out: Vec<(usize, (Vec<Event>, Vec<u32>))> = (0..nparts)
         .into_par_iter()
         .map_init(
-            || (Vec::new(), Vec::new()),
-            |(recs, events): &mut (Vec<Rec>, Vec<Event>), b| {
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |(recs, events, table): &mut (Vec<Rec>, Vec<Event>, Vec<u64>), b| {
                 recs.clear();
                 events.clear();
                 by_id.gather(b, recs);
-                let order = dedup_order(recs.len(), |i| recs[i].id.hash());
                 let mut kept = 0usize;
                 let emit = |r: &Rec, events: &mut Vec<Event>| {
                     if (r.price_kind >> 24) as u8 != INVALID {
@@ -242,7 +241,7 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                         events.push(Event { person, ts: r.ts, line: r.line, price_kind: r.price_kind, cat: r.cat });
                     }
                 };
-                let (alone, groups) = dedup_groups(&order);
+                let (alone, groups) = dedup_find(recs.len(), |i| recs[i].id.hash(), table);
                 // unique ids in memory order (sequential reads), then the groups of copies
                 for (i, r) in recs.iter().enumerate() {
                     if alone[i] {
