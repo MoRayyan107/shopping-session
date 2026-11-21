@@ -79,10 +79,28 @@ Data lives outside the repo: the generator (built in `rust:1.85.0-slim-bookworm`
 | Everything else | < 1 s | ~2.5 s |
 | **Total** | 7.9 s (6.9 s in Docker) | 19.2 s |
 
+## Quick wins (after `oracle-v1`), each matching it exactly
+
+Checked on the 36 fixtures and on `dev`, `big3x`, `s2`, `s4` and `s15` (seed 15's window holds Feb 29, 2028)
+with `tests/check_oracle.py` (stored `oracle-v1` outputs in `../data/oracle/`). Best of 3, local.
+
+| Change | dev total | big3x total |
+| ------ | --------- | ----------- |
+| `oracle-v1` | 7.87 s | 19.63 s |
+| Dedup on the raw `ingest_ts` string (dedup 1.90 -> 0.27 s; the parse moved to validation) | 7.39 s | 18.57 s |
+| `ts_parse` with `translate()` shape templates and fixed positions, no regex | 4.51 s | 12.04 s |
+| CSV: materialise the lines so the dialect check runs on all threads (parse 4.05 -> 1.68 s on big3x) | **3.82 s** | **9.49 s** |
+| Tried, not kept: read/split concurrently per file group (4 cursors). 1.71 -> 1.35 s in isolation, but no gain inside the pipeline | | |
+
+Findings: DuckDB parallelises a query by chunks of its source rows, so work fed from `read_text` (one row
+per file) runs on one thread; a list unnested straight out of `read_text` + `string_split` in a single query
+showed quadratic cost in a probe, linear once materialised.
+
+**At 20M events (practice size; seed 3, 1.8 GB) the DuckDB pipeline does not finish in 60 s**: parse events
+14.0 s, dedup 6.2 s, validate 27.0 s, before sessions. Extrapolated about 70 s at 20M locally and over the
+final's 3-minute cap at 60M. A native pipeline is needed, not just faster.
+
 ## Next
 
-1. Quick wins in DuckDB, one at a time, each diffed against `oracle-v1` on the fixtures, dev, big3x and
-   at least three more seeds (one with Feb 29, 2028): dedup on the raw `ingest_ts` string; `ts_parse`
-   without regex extraction; CSV reading in parallel across file groups.
-2. Then a design (for approval) for a native Rust pipeline. The practice data is about 20M events, the
-   leaders are at 1 to 1.5 s, and the final is about 60M events with a 3-minute cap.
+A design (for approval) for a native Rust pipeline. The practice data is about 20M events, the leaders are
+at 1 to 1.5 s, and the final is about 60M events with a 3-minute cap.
