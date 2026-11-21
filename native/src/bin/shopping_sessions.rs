@@ -7,7 +7,7 @@ use std::time::Instant;
 use shopping_sessions_native::dump::Dumper;
 use shopping_sessions_native::events::{Event, PURCHASE, TYPE_NAMES};
 use shopping_sessions_native::pq::{write_table, Col, CAMPAIGN_DAILY, USER_DAILY};
-use shopping_sessions_native::raw::{parse, Mapped};
+use shopping_sessions_native::raw::{parse, prefetch, taken_all, Mapped};
 use shopping_sessions_native::span::Store;
 use shopping_sessions_native::ts::parse_ts;
 use shopping_sessions_native::{clicks, daily, events, links, sessions};
@@ -55,25 +55,51 @@ fn main() {
     eprintln!("window [{ws}, {we}) ms");
 
     // Stage 1: parse
-    let ev_files = Mapped::dir(&data.join("events")).expect("map events");
-    let ck_files = Mapped::dir(&data.join("clicks")).expect("map clicks");
-    let ln_files = Mapped::dir(&data.join("links")).expect("map links");
+    // the mappings live until the process exits, so they are leaked as &'static (the prefetch thread borrows them)
+    let ev_files: &'static Mapped = Box::leak(Box::new(Mapped::dir(&data.join("events")).expect("map events")));
+    let ck_files: &'static Mapped = Box::leak(Box::new(Mapped::dir(&data.join("clicks")).expect("map clicks")));
+    let ln_files: &'static Mapped = Box::leak(Box::new(Mapped::dir(&data.join("links")).expect("map links")));
+    // read-ahead: the links first (they are parsed before anything else), the events and clicks once the
+    // links are in, so the small links read never queues behind a gigabyte of event reads
+    let pf_on = std::env::var("NATIVE_PREFETCH").as_deref() != Ok("0");
+    let pf_step = std::env::var("NATIVE_PREFETCH_MB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4) << 20;
+    let pf_threads = std::env::var("NATIVE_PREFETCH_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
+    // How far the events + clicks read-ahead may run past the parse (0 = unbounded). Unbounded when MEM_GB
+    // holds the whole input in the page cache beside the program's own memory (about 1.1x the input) with room
+    // to spare (MEM_GB >= 2.5x the input); otherwise (or without MEM_GB) 512 MB, so under memory pressure the
+    // read-ahead never evicts input pages still to be used. NATIVE_PREFETCH_AHEAD_MB overrides. Only a hint.
+    let input_bytes = ev_files.bytes() + ck_files.bytes() + ln_files.bytes();
+    let mem_bytes = std::env::var("MEM_GB").ok().and_then(|s| s.trim().parse::<f64>().ok()).map(|g| g * (1u64 << 30) as f64);
+    let pf_ahead = match std::env::var("NATIVE_PREFETCH_AHEAD_MB").ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(mb) => mb << 20,
+        None if mem_bytes.is_some_and(|m| m >= 2.5 * input_bytes as f64) => 0,
+        None => 512 << 20,
+    };
+    eprintln!("read-ahead window: {}", if pf_ahead == 0 { "unbounded".to_string() } else { format!("{} MB", pf_ahead >> 20) });
+    if pf_on {
+        prefetch(&[ln_files], pf_step, pf_threads, 0);
+    }
     let pr_file = Mapped::file(&data.join("products.csv")).expect("map products.csv");
     let ca_file = Mapped::file(&data.join("campaigns.csv")).expect("map campaigns.csv");
     clock.lap("map files", format!("{:.0} MB", (ev_files.bytes() + ck_files.bytes() + ln_files.bytes()) as f64 / 1e6));
     // every string is an 8-byte Span into these files (or the side store)
-    let (store, first) = Store::new(&[&ev_files, &ck_files, &ln_files]);
+    let (store, first) = Store::new(&[ev_files, ck_files, ln_files]);
     let links = parse::<2>(&ln_files);
+    if pf_on {
+        prefetch(&[ev_files, ck_files], pf_step, pf_threads, pf_ahead);
+    }
     let products = parse::<2>(&pr_file);
     let campaigns = parse::<2>(&ca_file);
     clock.lap("parse links, products, campaigns", format!("{} / {} / {}", links.len(), products.len(), campaigns.len()));
     dump.raw("links", ["user_id_a", "user_id_b"], &links);
     // Stage 2 pass 1 (split + validate events) runs while one thread does stage 3 (linked IDs)
     let cats = events::Categories::new(&products);
-    let (ev_split, (n_renamed, ptab)) = rayon::join(
+    let (ev_split, (n_links, n_renamed, ptab)) = rayon::join(
         || events::split(&ev_files, first[0], &store, &cats, ws, we),
         || {
+            let mut t0 = std::time::Instant::now();
             let m = links::person_map(&links);
+            shopping_sessions_native::util::prof("links: person map (one thread, beside the split)", &mut t0);
             let t = links::PersonTable::new(&m, &store);
             dump.table("person_map", &format!("message person_map {{ {S} id (STRING); {S} person (STRING); }}"), || {
                 vec![
@@ -81,11 +107,13 @@ fn main() {
                     Col::OptStr(m.values().map(|v| Some(v.to_vec())).collect()),
                 ]
             });
-            (m.len(), t)
+            (links.len(), m.len(), t)
         },
     );
-    drop(links);
-    clock.lap("events split + validate | linked IDs", format!("{} lines | {} renamed IDs", ev_split.len(), n_renamed));
+    clock.lap(
+        "events split + validate | links, linked IDs",
+        format!("{} lines | {} links, {} renamed IDs", ev_split.len(), n_links, n_renamed),
+    );
     let built = events::dedup(ev_split, &ptab, &store);
     clock.lap(
         "events dedup + person",
@@ -179,6 +207,7 @@ fn main() {
     // Stage 6: clicks, credit, assists
     let camps = clicks::Campaigns::new(&campaigns);
     let ck = clicks::build(&ck_files, first[1], &store, &ptab, &camps, ws, we);
+    taken_all();
     drop(ptab);
     clock.lap("clicks dedup + validate + person", ck.iter().map(Vec::len).sum::<usize>());
     let cr = clicks::credit(&store, &parts, &ck, &camps, dump.wants("session_assist"));

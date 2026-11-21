@@ -10,7 +10,7 @@ use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::sessions::{cmp_person, group_by_person, same_person, Part};
 use crate::span::{Span, Store};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, map_in_order, sort_by_bucket, Buckets, FxMap, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -144,9 +144,8 @@ pub fn build<'a>(
     let bucket = |h: u64| (h >> (64 - PART_BITS)) as usize;
     assert!(camps.names.len() < VALID as usize, "too many campaigns");
     // pass 1: split + validate every line; each piece's records ordered by click_id-hash bucket
-    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = pieces_with_file(files, first)
-        .par_iter()
-        .map_init(Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+            crate::raw::note_taken(piece.len());
             recs.clear();
             let mut f: Row<'a, 4> = [None; 4];
             for line in lines(piece) {
@@ -181,8 +180,7 @@ pub fn build<'a>(
                 recs.push(rec);
             }
             sort_by_bucket(recs, |r| bucket(r.idhash))
-        })
-        .collect();
+        });
     let by_id = Buckets::new(blocks);
     // pass 2: dedup each id bucket; kept valid clicks go to person buckets
     let out: Vec<(Vec<Click>, Vec<u32>)> = (0..nparts)

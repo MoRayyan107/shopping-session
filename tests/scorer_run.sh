@@ -1,6 +1,8 @@
 #!/bin/sh
 # One scorer-style run of an image on a dataset held in a Docker volume, keeping everything for the record:
 #   sh tests/scorer_run.sh IMAGE DATA_VOLUME NAME [MEM]        (MEM default 12g; env EXTRA_ENV="-e K=V ...")
+# COLD=1 drops the Docker VM's page cache first (privileged container), so the input is read from disk.
+# A candidate binary: BIN=/target/release/shopping_sessions EXTRA_MOUNT="-v native-target:/target:ro".
 # The container is kept (no --rm, named run_NAME). It writes to the volumes out_NAME / scr_NAME, and the
 # outputs are copied to $HOSTDIR/NAME (default ../dockertmp/NAME) for scripts/compare.py.
 # Inside, a sampler records anon/file memory (cgroup memory.stat) every 0.2 s; memory.peak is read at the end.
@@ -16,6 +18,9 @@ docker rm -f "run_$NAME" >/dev/null 2>&1 || true
 for v in "out_$NAME" "scr_$NAME"; do docker volume create "$v" >/dev/null; done
 docker run --rm --user 0 -v "out_$NAME":/o -v "scr_$NAME":/s --entrypoint sh "$IMAGE" \
   -c 'rm -rf /o/* /s/*; chmod 777 /o /s'
+if [ "${COLD:-0}" = 1 ]; then
+  docker run --rm --privileged --user 0 --entrypoint sh "$IMAGE" -c 'sync; echo 1 > /proc/sys/vm/drop_caches'
+fi
 s=$(date +%s%N)
 # TIMEOUT_S: stop the container after that many seconds (the run is then recorded as exit 137)
 killer=""; if [ -n "${TIMEOUT_S:-}" ]; then (sleep "$TIMEOUT_S"; docker stop -t 1 "run_$NAME" >/dev/null 2>&1) & killer=$!; fi
@@ -26,11 +31,11 @@ docker run --name "run_$NAME" --platform linux/amd64 \
   --user 1000:1000 \
   -v "$VOL":/data:ro -v "out_$NAME":/output -v "scr_$NAME":/scratch \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU=8 -e MEM_GB="${MEM%g}" ${EXTRA_ENV:-} \
+  -e NCPU=8 -e MEM_GB="${MEM%g}" ${EXTRA_ENV:-} ${EXTRA_MOUNT:-} -e BIN="${BIN:-/app/shopping_sessions}" \
   --entrypoint sh "$IMAGE" -c '
     ( while :; do awk "/^(anon|file|pgmajfault) /{printf \"%s \", \$2} END{print \"\"}" /sys/fs/cgroup/memory.stat; sleep 0.2; done ) > /scratch/mem.log &
     sampler=$!
-    /app/shopping_sessions 2> /scratch/log.txt; code=$?
+    "$BIN" 2> /scratch/log.txt; code=$?
     kill $sampler
     echo $code > /scratch/exit
     cat /sys/fs/cgroup/memory.peak > /scratch/peak

@@ -190,6 +190,38 @@ mod tests {
 
 pub const NPARTS: usize = 1 << PART_BITS;
 
+/// `f` over `items` on every pool thread, handing items out strictly in order (a shared counter), so the
+/// work moves through the input front to back, behind the read-ahead. Results are in item order, exactly
+/// as `items.par_iter().map_init(init, f).collect()` would give them.
+pub fn map_in_order<T, S, R, I, F>(items: &[T], init: I, f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send + Sync,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &T) -> R + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    let out: Vec<OnceLock<R>> = (0..items.len()).map(|_| OnceLock::new()).collect();
+    let next = AtomicUsize::new(0);
+    rayon::scope(|s| {
+        for _ in 0..rayon::current_num_threads() {
+            s.spawn(|_| {
+                let mut state = init();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= items.len() {
+                        break;
+                    }
+                    let r = f(&mut state, &items[i]);
+                    assert!(out[i].set(r).is_ok(), "item {i} done twice");
+                }
+            });
+        }
+    });
+    out.into_iter().map(|c| c.into_inner().expect("every item is done")).collect()
+}
+
 /// Rows of many blocks, each block ordered by bucket (0..NPARTS) with the start of every bucket, so bucket
 /// b is the run of slices blocks[k][start[b]..start[b+1]] in block order. Nothing is copied to build it.
 pub struct Buckets<T> {

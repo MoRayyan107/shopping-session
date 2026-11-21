@@ -15,7 +15,7 @@ use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
 use crate::ts::{parse_price, parse_ts};
-use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
 
 pub const VIEW: u8 = 0;
 pub const CART: u8 = 1;
@@ -159,9 +159,8 @@ fn bucket(h: u64) -> usize {
 /// Pass 1: split + validate every line; each piece's records ordered by hash(event_id) bucket.
 pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Categories<'_>, ws: i64, we: i64) -> Buckets<Rec> {
     let mut t = std::time::Instant::now();
-    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = pieces_with_file(files, first)
-        .par_iter()
-        .map_init(Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+            crate::raw::note_taken(piece.len());
             recs.clear();
             let mut f: Row<'_, 7> = [None; 7];
             for line in lines(piece) {
@@ -194,8 +193,7 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
                 recs.push(rec);
             }
             sort_by_bucket(recs, |r| bucket(r.idhash))
-        })
-        .collect();
+        });
     prof("events: split + validate into blocks", &mut t);
     Buckets::new(blocks)
 }

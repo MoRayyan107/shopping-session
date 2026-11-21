@@ -200,7 +200,7 @@ read at random (person IDs are slices into the files), so pages are evicted and 
 Useful but not enough: the record layout itself has to shrink. To be re-measured on top of the new layout and
 kept only if it still helps.
 
-The unverified 8-byte line splitter is set aside as `git stash` "8-byte splitter (unverified)" (also
+The unverified 8-byte line splitter is set aside as `git stash` "8-byte splitter (unverified)" in the D: repo, rescued as `wip-patches/02-stash-8byte-splitter.patch` on branch `speed-wip` (also
 `../dockertmp/splitter_8byte.patch`).
 
 ### Lower-memory layout (branch `memory`)
@@ -244,7 +244,7 @@ read IDs from the input at random. The threshold is between 8 and 10 GiB; the sc
 layout (2.83-2.92 s with, 2.51-2.55 s without; `597cf7d` 2.70-2.77 s) and at p60m 12g gave 13.1 s with against
 9.3 / 11.8 s without, for 0.2 GB less anon (5.68 vs 5.86 GB). The smaller layout is what fixed p60m.
 
-Practice score of `597cf7d` on the scorer: 4.09 s, correct (leaders 0.75-0.94 s).
+Practice scores on the scorer: `597cf7d` 4.09 s, `dcc09e9` 3.88 s, both correct (leaders 0.75-0.94 s).
 
 Optimisation history at 20M (in Docker, tmpfs output): first exact run 14.1 s; campaigns interned (credit +
 assists 5.2 -> 0.5 s) 12.4 s; validate while parsing, id buckets then person buckets, person-hash sorting
@@ -258,3 +258,61 @@ SWAR line/field splitting, smaller records (offsets instead of slices), a dictio
 
 A design (for approval) for a native Rust pipeline. The practice data is about 20M events, the leaders are
 at 1 to 1.5 s, and the final is about 60M events with a 3-minute cap.
+
+## Speed work (branch `speed`)
+
+Cold vs warm, p20m, `dcc09e9` (`tests/scorer_run.sh`, `COLD=1` drops the Docker VM page cache with
+`echo 1 > /proc/sys/vm/drop_caches` in a privileged container): cold whole run 3.80-4.18 s, pipeline 3.36-3.68 s
+(the scorer's 3.88 s is a cold number); warm 2.94-2.99 s / 2.48-2.52 s. About 1.0-1.2 s is waiting for the disk,
+almost all in the events split (cold 1.7 s, warm 0.93 s). Raw cold read of p20m (1.83 GB): 1.06 s with one
+reader, 0.57 s with 8 parallel `cat`s (3.2 GB/s): the I/O floor here. ~0.45 s per run is outside the pipeline
+(container start/stop, wrapper).
+
+`tests/ab.sh VOLUME RUNS BASE_IMAGE [MEM]`: alternating cold/warm runs of the base image's binary and the
+candidate in `native-target`, scorer flags (through `tests/scorer_run.sh`). Baseline image:
+`shopping-sessions:fresh-dcc09e9` (the fresh-clone build of the submitted commit).
+
+### 1. Read-ahead (`raw::prefetch`, `util::map_in_order`): verified, committed
+
+- `raw::prefetch`: madvise WILLNEED over the files in their order of use, 4 threads taking 4 MB chunks from a
+  shared counter; links first, events + clicks once the links are parsed. Only a hint to the kernel: it never
+  changes what is read. `NATIVE_PREFETCH=0` turns it off; `_MB`, `_THREADS`, `_MODE=read` (pread, no better).
+- `util::map_in_order`: events/clicks pieces handed out strictly in order (results in piece order, exactly
+  as `par_iter().map_init().collect()`), so the parse moves front to back behind the read-ahead.
+- **Window.** Unbounded read-ahead hurt under memory pressure: p60m cold at 10g 23.4 s, 299k major faults
+  (`dcc09e9` 20.1 s, 116k): input pages still to be read at random were evicted. So the events + clicks
+  read-ahead runs at most 512 MB past what the parse has taken (`raw::TAKEN`), unless `MEM_GB >= 2.5x` the
+  input (the program's own memory is ~1.1x the input, so the whole input then fits in the cache beside it):
+  then unbounded. On the scorer (24 GB) p20m and p60m are both unbounded; locally p20m at 12g is unbounded,
+  p60m at 12g / 10g windowed. `NATIVE_PREFETCH_AHEAD_MB` overrides (0 = unbounded).
+- Results (all cold runs after the machine was kept awake, see below):
+
+| Run | `dcc09e9` | read-ahead |
+| --- | --- | --- |
+| p20m cold, whole run / pipeline | 3.95-4.03 / 3.49-3.57 s | **3.37-3.47 / 2.90-2.96 s** |
+| p20m warm, whole run / pipeline | 3.03-3.14 / 2.54-2.66 s | 3.00-3.05 / 2.54-2.60 s (same) |
+| p60m 14g cold, unbounded (the scorer's mode) | 11.7 s | **9.5 s**, MATCH |
+| p60m 12g cold, windowed | 11.4 s | 11.9 s (one earlier run 10.9 s), MATCH, anon 5.95 GB |
+| p60m 10g cold, windowed | 19.6-20.1 s | 18.1-20.6 s, MATCH, anon 6.0 GB |
+
+  Verified exact: 17 unit tests; every stage table + both outputs on all 61 datasets and on p20m.
+  Parsing links inside the join branch was worse (the person map becomes the critical path); not kept.
+
+### Environment
+
+- `D:` is a USB drive (WD P40) that Windows powers off when idle ("USB selective suspend"); each time, Docker
+  Desktop loses its `D:` share until Docker is restarted. Work now happens in a clone on `C:`
+  (`C:\Users\Mohammad Rayyan\Documents\shopping-session`), with the oracle cache and small datasets copied to
+  `..\data` (p20m / p60m inputs stay in the Docker volumes `vol_p20m` / `vol_p60m`; `..\data\p20m` is an empty
+  folder, the mount point `native_check.py` needs inside the read-only `/data`). `dev-answer/` copied too.
+- **The laptop goes into Modern Standby when idle, even mid-run**: the Docker VM freezes, a run's wall time grows
+  by the standby (one p60m run: 768 s wall, 20.9 s by its own clock) and host-side timeouts do not fire. Before
+  timing, keep it awake (`SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` in a background
+  PowerShell loop) and check `Kernel-Power` events 506/507 afterwards; discard any run that overlaps one.
+
+### Next
+
+Compute (warm p20m, read-ahead build): split + validate 0.95 s, dedup + person 0.59 s, sessions 0.38 s, clicks
+0.35 s, credit 0.13 s, write 0.09 s, total 2.57 s, plus ~0.45 s outside the pipeline. Split is ~350 ns per line
+on 8 threads: every line is scanned byte by byte for `\n`, then `,`, then `"` per field. Next: the 8-byte
+splitter (stash), then a per-stage timeline across the threads.
