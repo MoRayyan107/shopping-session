@@ -315,7 +315,7 @@ mod tests {
         for round in 0..3 {
             for s in scatters.iter_mut() {
                 for i in 0..20_000u32 {
-                    let b = if i % 3 == 0 { 7 } else { ((i * 2654435761u32) >> 24) as usize };
+                    let b = if i % 3 == 0 { 7 } else { (i.wrapping_mul(2654435761u32) >> 24) as usize };
                     s.push(b, (b as u8, id));
                     id += 1;
                 }
@@ -328,7 +328,7 @@ mod tests {
         for _ in 0..3 {
             for p in per.iter_mut() {
                 for i in 0..20_000u32 {
-                    let b = if i % 3 == 0 { 7 } else { ((i * 2654435761u32) >> 24) as usize };
+                    let b = if i % 3 == 0 { 7 } else { (i.wrapping_mul(2654435761u32) >> 24) as usize };
                     p[b].push((b as u8, id));
                     id += 1;
                 }

@@ -85,12 +85,13 @@ fn parse_f2(s: &[u8; 25]) -> Option<i64> {
 /// itself elsewhere), `digits` has 0xFF in the digit places. A digit byte is good when its `e` is at most 9
 /// (exactly `0`-`9`), a separator byte when its `e` is 0. Nonzero iff some byte is bad: a byte's carry only
 /// reaches higher bytes, and only out of a bad byte, so the lowest bad byte is always seen and good bytes
-/// never set a flag.
+/// never set a flag. The add wraps: a carry out of the top byte comes only from a bad top byte (e >= 0x8A),
+/// which its own bit 7 already flags.
 #[inline(always)]
 fn bad_bytes(e: u64, digits: u64) -> u64 {
     let hi = digits & 0x8080_8080_8080_8080;
     let k = digits & 0x7676_7676_7676_7676;
-    (e & !digits) | ((((e & digits) + k) | e) & hi)
+    (e & !digits) | ((((e & digits).wrapping_add(k)) | e) & hi)
 }
 
 /// Each byte k (k + 1 also a digit place) becomes 10 * digit k + digit k + 1; digits are at most 9, so no
