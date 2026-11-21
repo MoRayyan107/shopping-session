@@ -3,6 +3,7 @@
 pub mod csv;
 pub mod dump;
 pub mod events;
+pub mod links;
 pub mod util;
 pub mod pq;
 pub mod raw;

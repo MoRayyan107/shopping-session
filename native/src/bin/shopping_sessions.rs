@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
-use shopping_sessions_native::events;
+use shopping_sessions_native::{events, links};
 use shopping_sessions_native::pq::Col;
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
@@ -81,7 +81,7 @@ fn main() {
             "ev_valid",
             "message ev_valid { OPTIONAL BYTE_ARRAY user_id (STRING); OPTIONAL INT64 ts_ms; \
              OPTIONAL BYTE_ARRAY event_type (STRING); OPTIONAL BYTE_ARRAY product_id (STRING); OPTIONAL INT64 price_cents; }",
-            vec![
+            || vec![
                 Col::OptStr(ev.iter().map(|e| Some(e.user.to_vec())).collect()),
                 Col::OptI64(ev.iter().map(|e| Some(e.ts)).collect()),
                 Col::OptStr(ev.iter().map(|e| Some(events::TYPE_NAMES[e.kind as usize].to_vec())).collect()),
@@ -90,6 +90,21 @@ fn main() {
             ],
         );
         clock.lap("dump stage 2", "ev_valid");
+    }
+
+    // Stage 3: linked IDs
+    let pmap = links::person_map(&links);
+    clock.lap("linked IDs", format!("{} renamed IDs", pmap.len()));
+    if dump.on() {
+        dump.table(
+            "person_map",
+            "message person_map { OPTIONAL BYTE_ARRAY id (STRING); OPTIONAL BYTE_ARRAY person (STRING); }",
+            || vec![
+                Col::OptStr(pmap.keys().map(|k| Some(k.to_vec())).collect()),
+                Col::OptStr(pmap.values().map(|v| Some(v.to_vec())).collect()),
+            ],
+        );
+        clock.lap("dump stage 3", "person_map");
     }
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());

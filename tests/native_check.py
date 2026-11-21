@@ -40,8 +40,8 @@ def expand(names):
     return out
 
 
-def run_native(names, work, ncpu):
-    script = []
+def run_native(names, work, ncpu, tables):
+    script = [f"export NATIVE_DUMP_TABLES={','.join(tables) or 'none'}"]
     for n in names:
         src = f"/fx/{n[3:]}/input" if n.startswith("fx/") else f"/data/{n}"
         safe = n.replace("/", "__")
@@ -89,7 +89,7 @@ def main():
     tables = [t for t in a.tables.split(",") if t]
     work = Path(a.keep) if a.keep else Path(tempfile.mkdtemp(prefix="native_check_"))
     work.mkdir(parents=True, exist_ok=True)
-    run_native(names, work, a.ncpu)
+    run_native(names, work, a.ncpu, tables)
     con = duckdb.connect()
     bad = 0
     for n in names:

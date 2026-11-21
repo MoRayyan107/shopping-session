@@ -6,6 +6,8 @@ use crate::raw::Row;
 
 pub struct Dumper {
     dir: Option<PathBuf>,
+    /// NATIVE_DUMP_TABLES: comma-separated names to dump (all when unset).
+    only: Option<Vec<String>>,
 }
 
 impl Dumper {
@@ -14,10 +16,16 @@ impl Dumper {
         if let Some(d) = &dir {
             std::fs::create_dir_all(d).expect("create NATIVE_DUMP_DIR");
         }
-        Dumper { dir }
+        let only = std::env::var("NATIVE_DUMP_TABLES").ok().map(|s| s.split(',').map(str::to_string).collect());
+        Dumper { dir, only }
     }
+    /// True when dumping is on at all (cheap check before building dump columns).
     pub fn on(&self) -> bool {
         self.dir.is_some()
+    }
+    /// True when this table should be dumped.
+    pub fn wants(&self, name: &str) -> bool {
+        self.dir.is_some() && self.only.as_ref().is_none_or(|o| o.iter().any(|t| t == name))
     }
     fn path(&self, name: &str) -> PathBuf {
         self.dir.as_ref().unwrap().join(format!("{name}.parquet"))
@@ -25,7 +33,7 @@ impl Dumper {
 
     /// A table of nullable string columns (the raw_* tables).
     pub fn raw<const N: usize>(&self, name: &str, columns: [&str; N], rows: &[Row<'_, N>]) {
-        if !self.on() {
+        if !self.wants(name) {
             return;
         }
         let schema = format!(
@@ -38,8 +46,9 @@ impl Dumper {
     }
 
     /// Any table: `schema` is a Parquet message type, `cols` in its order.
-    pub fn table(&self, name: &str, schema: &str, cols: Vec<Col>) {
-        if self.on() {
+    pub fn table(&self, name: &str, schema: &str, cols: impl FnOnce() -> Vec<Col>) {
+        if self.wants(name) {
+            let cols = cols();
             write_table(&self.path(name), schema, &cols).expect("write dump");
         }
     }
