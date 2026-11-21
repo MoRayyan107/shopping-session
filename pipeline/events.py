@@ -37,24 +37,30 @@ def build_events(con, ws, we, log=lambda *a: None):
     con.execute(PRICE_MACRO)
 
     # 1-2. drop empty event_id, then keep the copy with the smallest ingest_ts (validity is not looked at yet).
-    # Copies with equal ingest_ts are identical by the rules; the extra sort keys only make the pick deterministic.
+    # ingest_ts is always valid fixed-width F1 (rules.md), and for that form byte order IS time order, so the raw
+    # string is compared and only the kept copies are parsed. Copies with equal ingest_ts are identical by the
+    # rules; the extra sort keys only make the pick deterministic.
+    bad_form = con.execute(
+        "SELECT count(*) FROM raw_events WHERE event_id IS NOT NULL AND (ingest_ts IS NULL OR length(ingest_ts) <> 20)"
+    ).fetchone()[0]
+    if bad_form:
+        log(f"WARNING: {bad_form} event copies have an ingest_ts that is not 20 characters (rules say it is always F1); "
+            "dedup order for those may differ from time order")
     step("""
         CREATE OR REPLACE TEMP TABLE ev_kept AS
-        SELECT * FROM (SELECT *, ts_parse(ingest_ts) AS ingest_ms FROM raw_events WHERE event_id IS NOT NULL)
+        SELECT * FROM raw_events WHERE event_id IS NOT NULL
         QUALIFY row_number() OVER (
             PARTITION BY event_id
-            ORDER BY ingest_ms ASC NULLS LAST, user_id, ts, event_type, product_id, price_cents) = 1
-    """, 'dedup on event_id (incl. ts_parse(ingest_ts))')
-    bad_ingest = con.execute("SELECT count(*) FROM ev_kept WHERE ingest_ms IS NULL").fetchone()[0]
-    if bad_ingest:
-        log(f"WARNING: {bad_ingest} kept events have an unparseable ingest_ts (rules say this never happens); they are dropped as late")
+            ORDER BY ingest_ts ASC NULLS LAST, user_id, ts, event_type, product_id, price_cents) = 1
+    """, 'dedup on event_id (raw ingest_ts string)')
 
-    # 3-4. validate the kept copy, then drop late events
+    # 3-4. validate the kept copy, then drop late events (an unparseable ingest_ts makes the late test NULL: dropped)
     step(f"""
         CREATE OR REPLACE TEMP TABLE ev_valid AS
         SELECT user_id, ts_ms, event_type, product_id,
                CASE WHEN event_type = 'purchase' THEN price END AS price_cents
-        FROM (SELECT *, ts_parse(ts) AS ts_ms, price_parse(price_cents) AS price FROM ev_kept)
+        FROM (SELECT *, ts_parse(ts) AS ts_ms, ts_parse(ingest_ts) AS ingest_ms, price_parse(price_cents) AS price
+              FROM ev_kept)
         WHERE user_id IS NOT NULL
           AND product_id IS NOT NULL
           AND ts_ms >= {ws} AND ts_ms < {we}
