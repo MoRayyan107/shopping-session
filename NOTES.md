@@ -412,6 +412,26 @@ single and double byte mutation of four bases and every day of eight years); all
 61 datasets and p20m; the same with `NATIVE_SIMD=off` (61/61 and p20m); `NATIVE_KEY_INLINE_MAX=4` (61/61);
 side store (41/41).
 
+**Fresh-clone proof of `53dd450bf3d15dc84feaf557dc7b46249644431e` (2026-11-21): passed.** Clone, checkout, clean
+tree, `--no-cache` build (`shopping-sessions:fresh-53dd450`), 36/36 fixtures, dev MATCH (pipeline 0.58 s),
+p20m scorer flags at 24g from `vol_p20m`: cold 2.56 s whole run / 1.94 s pipeline, warm 2.30 / 1.63 s, MATCH.
+
+### Steps 2 and 3: tried, measured, not kept (patches outside the repo)
+
+The profile charged most of dedup to the person-table probe and the sorts; measuring each change showed the
+time is spread over code that waits on memory while records (40-64 bytes) move between buckets.
+
+| Change (each A/B vs `53dd450`, 3 alternating pairs) | Result |
+| --- | --- |
+| Person table cut into 256 cache-sized parts; lookups done per bucket after dedup, movers re-bucketed | dedup 0.39 -> 0.31 s *without* lookups, but the person pass costs 0.14 s: net slower (0.45 s) |
+| Linear-time copy finder (hash table of row indices) instead of sorting hash keys | slower (dedup 0.376 -> 0.417 s): its probes read the 64-byte records at random |
+| `glibc.malloc.hugetlb=1` (THP for the heap; the kernel here has THP `madvise`) | within noise |
+| Radix sort by (person hash bits, ts) for sessions and clicks, with exact fallbacks | sessions 0.155 -> 0.215 s (the in-place comparison sort is cache-friendly; radix permutes into new memory), clicks 0.20 -> 0.18 s: net no gain |
+| Stable LSD radix of dedup's hash keys (identical order) | no change (0.370 vs 0.372 s) |
+
+Outside the pipeline: inside the container the process takes 1.60-1.64 s for a 1.53-1.56 s pipeline (start-up
+plus exit ~80 ms); `docker run` adds ~0.5 s (an empty container is 0.44 s).
+
 **Fresh-clone proof of `918544b55430749be0b6499250c6e2830626e6f7` (2026-11-21): passed.** Clone from GitHub,
 checkout, clean tree, `--no-cache` build (`shopping-sessions:fresh-918544b`), 36/36 fixtures through
 `run_fixtures.py` + `scripts/docker_run.sh` (TMPDIR on the host, MSYS_NO_PATHCONV=1), dev MATCH (pipeline 0.61 s),
