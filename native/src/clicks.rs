@@ -5,9 +5,10 @@ use std::cmp::Ordering;
 use rayon::prelude::*;
 
 use crate::csv::{lines, split_line};
+use crate::key::Key;
 use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
-use crate::sessions::{cmp_person, group_by_person, same_person, Part};
+use crate::sessions::{group_by_person, Part};
 use crate::span::{Span, Store};
 use crate::ts::parse_ts;
 use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, map_in_order, sort_by_bucket, Buckets, FxMap, PART_BITS};
@@ -52,8 +53,8 @@ impl<'a> Campaigns<'a> {
 /// One valid click, mapped to its person (40 bytes).
 #[derive(Clone, Copy)]
 pub struct Click {
-    pub person: Span,
-    pub phash: u64,
+    /// the person's exact key; its bucket is the top bits of `person.hash()`
+    pub person: Key,
     pub click_id: Span,
     pub ts: i64,
     pub camp: u32,
@@ -78,9 +79,9 @@ const VALID: u32 = 1 << 31;
 #[derive(Clone, Copy)]
 pub struct Rec {
     idhash: u64,
-    uhash: u64,
+    /// the user ID's exact key (the default key when the copy is invalid)
+    user: Key,
     line: Span,
-    user: Span,
     ts: i64,
     /// campaign id in the low 31 bits, VALID in the top bit
     camp_valid: u32,
@@ -168,14 +169,13 @@ pub fn build<'a>(
                 let rec = match valid() {
                     Some((user, camp, ts)) => Rec {
                         idhash,
-                        uhash: hash_bytes(user),
+                        user: store.key(file, user),
                         line: line_sp,
-                        user: store.span(file, user),
                         ts,
                         camp_valid: camp | VALID,
                         id_meta: meta,
                     },
-                    None => Rec { idhash, uhash: 0, line: line_sp, user: Span::EMPTY, ts: 0, camp_valid: 0, id_meta: meta },
+                    None => Rec { idhash, user: Key::default(), line: line_sp, ts: 0, camp_valid: 0, id_meta: meta },
                 };
                 recs.push(rec);
             }
@@ -194,9 +194,9 @@ pub fn build<'a>(
                 let order = dedup_order(recs.len(), |i| recs[i].idhash);
                 let emit = |r: &Rec, clicks: &mut Vec<Click>| {
                     if r.camp_valid & VALID != 0 {
-                        let (person, phash) = ptab.lookup(r.uhash, r.user, store);
+                        let person = ptab.lookup(r.user);
                         let click_id = store.span_of(r.id(store));
-                        clicks.push(Click { person, phash, click_id, camp: r.camp_valid & !VALID, ts: r.ts });
+                        clicks.push(Click { person, click_id, camp: r.camp_valid & !VALID, ts: r.ts });
                     }
                 };
                 let (alone, groups) = dedup_groups(&order);
@@ -223,7 +223,7 @@ pub fn build<'a>(
                         }
                     }
                 }
-                sort_by_bucket(clicks, |c| bucket(c.phash))
+                sort_by_bucket(clicks, |c| bucket(c.person.hash()))
             },
         )
         .collect();
@@ -231,13 +231,13 @@ pub fn build<'a>(
     let mut by_person = Buckets::new(out).into_vecs();
     by_person
         .par_iter_mut()
-        .for_each(|v| group_by_person(store, v, |c| (c.phash, c.person, c.ts, store.get(c.click_id))));
+        .for_each(|v| group_by_person(v, |c| (c.person, c.ts, store.get(c.click_id))));
     by_person
 }
 
 /// Credit and assists for every session, part by part. Sessions and clicks of a part are both ordered by
-/// (person hash, person), so one forward walk finds each person's clicks.
-pub fn credit(store: &Store<'_>, parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, keep_assists: bool) -> Vec<Credit> {
+/// person key, so one forward walk finds each person's clicks.
+pub fn credit(parts: &[Part], clicks: &[Vec<Click>], camps: &Campaigns<'_>, keep_assists: bool) -> Vec<Credit> {
     assert_eq!(clicks.len(), parts.len());
     let ncamp = camps.names.len();
     parts
@@ -253,16 +253,16 @@ pub fn credit(store: &Store<'_>, parts: &[Part], clicks: &[Vec<Click>], camps: &
             let mut stamp = vec![0u32; ncamp];
             let mut j = 0usize; // first click not yet passed
             let mut pc: &[Click] = &[];
-            let mut cur: Option<(u64, Span)> = None;
+            let mut cur: Option<Key> = None;
             for (si, s) in p.sessions.iter().enumerate() {
-                let sp = (s.phash, s.person);
-                if cur.is_none_or(|c| !same_person(store, c, sp)) {
+                let sp = s.person;
+                if cur != Some(sp) {
                     cur = Some(sp);
-                    while j < ck.len() && cmp_person(store, (ck[j].phash, ck[j].person), sp) == Ordering::Less {
+                    while j < ck.len() && ck[j].person < sp {
                         j += 1;
                     }
                     let mut e = j;
-                    while e < ck.len() && same_person(store, (ck[e].phash, ck[e].person), sp) {
+                    while e < ck.len() && ck[e].person == sp {
                         e += 1;
                     }
                     pc = &ck[j..e];
@@ -311,9 +311,8 @@ mod tests {
         let (l1, l2) = (&d[0..8], &d[9..20]);
         let mk = |line: &[u8], id: &[u8], meta: Option<u32>| Rec {
             idhash: 0,
-            uhash: 0,
+            user: Key::default(),
             line: store.span_of(&d[line.as_ptr() as usize - d.as_ptr() as usize..][..line.len()]),
-            user: Span::EMPTY,
             ts: 0,
             camp_valid: 0,
             id_meta: meta.unwrap_or_else(|| id_meta(line, id)),

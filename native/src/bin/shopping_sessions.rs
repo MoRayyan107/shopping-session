@@ -28,12 +28,37 @@ fn manifest_value(text: &str, key: &str) -> Option<String> {
 struct Clock {
     start: Instant,
     last: Instant,
+    /// with NATIVE_PROFILE: (cpu seconds, minor faults, major faults) of the process at the last lap
+    usage: Option<(f64, u64, u64)>,
+}
+
+/// (user + system cpu seconds, minor faults, major faults) of this process, from /proc/self/stat.
+fn proc_usage() -> Option<(f64, u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let f: Vec<&str> = s[s.rfind(')')? + 2..].split(' ').collect();
+    // after "pid (comm) ": state=0 ... minflt=7 majflt=9 utime=11 stime=12 (in clock ticks, 100 per second)
+    let n = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok());
+    Some(((n(11)? + n(12)?) as f64 / 100.0, n(7)?, n(9)?))
 }
 
 impl Clock {
     fn lap(&mut self, what: &str, detail: impl std::fmt::Display) {
         let now = Instant::now();
-        eprintln!("[{:7.3}s] {what}: {detail}", (now - self.last).as_secs_f64());
+        let wall = (now - self.last).as_secs_f64();
+        let mut extra = String::new();
+        if let (Some(prev), Some(cur)) = (self.usage, self.usage.and(proc_usage())) {
+            let threads = rayon::current_num_threads() as f64;
+            extra = format!(
+                "   [cpu {:.2} s = {:.0}% of {} threads; faults {} minor, {} major]",
+                cur.0 - prev.0,
+                100.0 * (cur.0 - prev.0) / (wall * threads).max(1e-9),
+                threads,
+                cur.1 - prev.1,
+                cur.2 - prev.2
+            );
+            self.usage = Some(cur);
+        }
+        eprintln!("[{wall:7.3}s] {what}: {detail}{extra}");
         self.last = now;
     }
 }
@@ -47,7 +72,8 @@ fn main() {
         rayon::ThreadPoolBuilder::new().num_threads(n).build_global().expect("thread pool");
     }
     let dump = Dumper::from_env();
-    let mut clock = Clock { start: Instant::now(), last: Instant::now() };
+    let profile = std::env::var("NATIVE_PROFILE").is_ok();
+    let mut clock = Clock { start: Instant::now(), last: Instant::now(), usage: if profile { proc_usage() } else { None } };
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("read manifest.json");
     let ws = manifest_value(&manifest, "window_start").and_then(|s| parse_ts(s.as_bytes())).expect("window_start");
@@ -144,7 +170,7 @@ fn main() {
     );
 
     // Stage 4: sessions, day
-    let mut parts = sessions::sessionize(&store, built.by_person);
+    let mut parts = sessions::sessionize(built.by_person);
     clock.lap("sessions", parts.iter().map(|p| p.sessions.len()).sum::<usize>());
     if dump.on() {
         let all_s = || parts.iter().flat_map(|p| p.sessions.iter());
@@ -165,7 +191,7 @@ fn main() {
             ),
             || {
                 vec![
-                    Col::OptStr(all_e().map(|(_, e)| Some(store.get(e.person).to_vec())).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(e.person.to_vec(&store))).collect()),
                     Col::OptI64(all_e().map(|(_, e)| Some(e.ts)).collect()),
                     Col::OptI64(all_e().map(|(s, _)| Some(s.start)).collect()),
                     Col::OptDate(all_e().map(|(s, _)| Some(s.day)).collect()),
@@ -184,7 +210,7 @@ fn main() {
             ),
             || {
                 vec![
-                    Col::OptStr(all_s().map(|s| Some(store.get(s.person).to_vec())).collect()),
+                    Col::OptStr(all_s().map(|s| Some(s.person.to_vec(&store))).collect()),
                     Col::OptI64(all_s().map(|s| Some(s.start)).collect()),
                     Col::OptDate(all_s().map(|s| Some(s.day)).collect()),
                     Col::OptI64(all_s().map(|s| Some(s.n_events as i64)).collect()),
@@ -196,7 +222,7 @@ fn main() {
     }
 
     // Stage 5: user_daily
-    let ud = daily::user_daily(&store, &parts, &cats);
+    let ud = daily::user_daily(&parts, &cats);
     clock.lap("user_daily", ud.iter().map(Vec::len).sum::<usize>());
     dump.table("user_daily", USER_DAILY, || daily::user_daily_cols(&store, &ud));
     // nothing after user_daily reads the events (credit and assists use the sessions)
@@ -208,9 +234,10 @@ fn main() {
     let camps = clicks::Campaigns::new(&campaigns);
     let ck = clicks::build(&ck_files, first[1], &store, &ptab, &camps, ws, we);
     taken_all();
+    eprintln!("long IDs (over the inline limit): {}", store.long_ids());
     drop(ptab);
     clock.lap("clicks dedup + validate + person", ck.iter().map(Vec::len).sum::<usize>());
-    let cr = clicks::credit(&store, &parts, &ck, &camps, dump.wants("session_assist"));
+    let cr = clicks::credit(&parts, &ck, &camps, dump.wants("session_assist"));
     clock.lap(
         "credit + assists",
         format!(
@@ -229,7 +256,7 @@ fn main() {
             || {
                 let all = || ck.iter().flatten();
                 vec![
-                    Col::OptStr(all().map(|c| Some(store.get(c.person).to_vec())).collect()),
+                    Col::OptStr(all().map(|c| Some(c.person.to_vec(&store))).collect()),
                     Col::OptStr(all().map(|c| Some(store.get(c.click_id).to_vec())).collect()),
                     Col::OptStr(all().map(|c| Some(camps.names[c.camp as usize].to_vec())).collect()),
                     Col::OptI64(all().map(|c| Some(c.ts)).collect()),
@@ -245,7 +272,7 @@ fn main() {
             ),
             || {
                 vec![
-                    Col::OptStr(sc().map(|(s, _)| Some(store.get(s.person).to_vec())).collect()),
+                    Col::OptStr(sc().map(|(s, _)| Some(s.person.to_vec(&store))).collect()),
                     Col::OptI64(sc().map(|(s, _)| Some(s.start)).collect()),
                     Col::OptDate(sc().map(|(s, _)| Some(s.day)).collect()),
                     Col::OptBool(sc().map(|(s, _)| Some(s.has_purchase)).collect()),
@@ -265,7 +292,7 @@ fn main() {
             ),
             || {
                 vec![
-                    Col::OptStr(sa().map(|(s, _)| Some(store.get(s.person).to_vec())).collect()),
+                    Col::OptStr(sa().map(|(s, _)| Some(s.person.to_vec(&store))).collect()),
                     Col::OptI64(sa().map(|(s, _)| Some(s.start)).collect()),
                     Col::OptDate(sa().map(|(s, _)| Some(s.day)).collect()),
                     Col::OptStr(sa().map(|(_, k)| Some(camps.names[k as usize].to_vec())).collect()),

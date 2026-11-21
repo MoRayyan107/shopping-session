@@ -7,6 +7,9 @@
 //! bytes may have different spans, so comparisons of values compare the bytes (`Store::get`).
 use std::sync::RwLock;
 
+use crate::key::{Key, INLINE_MAX};
+use crate::util::{hash_bytes, FxMap};
+
 use crate::raw::Mapped;
 
 const FILE_BITS: u32 = 10;
@@ -34,7 +37,17 @@ impl Span {
     fn len(self) -> u64 {
         self.0 & MAX_LEN
     }
+    #[inline(always)]
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    pub fn from_raw(v: u64) -> Span {
+        Span(v)
+    }
 }
+
+const LONG_SHARDS: usize = 64;
 
 /// (file, offset, length) as a span, or None when a part is over its limit (the value goes to the side
 /// store). `max_len` is MAX_LEN except in the side-store tests (NATIVE_SPAN_MAX_LEN).
@@ -53,6 +66,11 @@ pub struct Store<'a> {
     by_addr: Vec<(usize, usize, u32)>,
     side: RwLock<Vec<&'a [u8]>>,
     max_len: u64,
+    /// IDs up to this many bytes get inline keys (`key::INLINE_MAX`, lowered by NATIVE_KEY_INLINE_MAX to test
+    /// the long path)
+    inline_max: usize,
+    /// canonical span of every long ID seen, sharded by hash
+    long: Vec<std::sync::Mutex<FxMap<&'a [u8], Span>>>,
 }
 
 impl<'a> Store<'a> {
@@ -67,10 +85,16 @@ impl<'a> Store<'a> {
             }
         }
         let max_len = std::env::var("NATIVE_SPAN_MAX_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_LEN).min(MAX_LEN);
-        (Store::from_slices(files, max_len), first)
+        let inline_max =
+            std::env::var("NATIVE_KEY_INLINE_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(INLINE_MAX).min(INLINE_MAX);
+        (Store::from_slices_with_inline(files, max_len, inline_max), first)
     }
 
     pub fn from_slices(files: Vec<&'a [u8]>, max_len: u64) -> Store<'a> {
+        Store::from_slices_with_inline(files, max_len, INLINE_MAX)
+    }
+
+    pub fn from_slices_with_inline(files: Vec<&'a [u8]>, max_len: u64, inline_max: usize) -> Store<'a> {
         let mut by_addr: Vec<(usize, usize, u32)> = files
             .iter()
             .enumerate()
@@ -78,7 +102,38 @@ impl<'a> Store<'a> {
             .map(|(i, f)| (f.as_ptr() as usize, f.as_ptr() as usize + f.len(), i as u32))
             .collect();
         by_addr.sort_unstable();
-        Store { files, by_addr, side: RwLock::new(Vec::new()), max_len }
+        let long = (0..LONG_SHARDS).map(|_| std::sync::Mutex::new(FxMap::default())).collect();
+        Store { files, by_addr, side: RwLock::new(Vec::new()), max_len, inline_max: inline_max.min(INLINE_MAX), long }
+    }
+
+    /// The exact key of ID `s`, which lies inside file `file`: inline when short, else its canonical span
+    /// (the first span registered for these bytes).
+    #[inline]
+    pub fn key(&self, file: u32, s: &'a [u8]) -> Key {
+        if s.len() <= self.inline_max {
+            return Key::inline(s);
+        }
+        self.long_key(s, || self.span(file, s))
+    }
+
+    /// Like `key`, for a slice inside any of the files (found by address).
+    pub fn key_of(&self, s: &'a [u8]) -> Key {
+        if s.len() <= self.inline_max {
+            return Key::inline(s);
+        }
+        self.long_key(s, || self.span_of(s))
+    }
+
+    #[cold]
+    fn long_key(&self, s: &'a [u8], span: impl FnOnce() -> Span) -> Key {
+        let shard = (hash_bytes(s) >> 58) as usize % LONG_SHARDS;
+        let mut m = self.long[shard].lock().unwrap();
+        Key::long(*m.entry(s).or_insert_with(span))
+    }
+
+    /// Distinct long IDs registered (logged).
+    pub fn long_ids(&self) -> usize {
+        self.long.iter().map(|m| m.lock().unwrap().len()).sum()
     }
 
     /// The span of `s`, which lies inside file `file`.

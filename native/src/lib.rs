@@ -5,6 +5,7 @@ pub mod csv;
 pub mod daily;
 pub mod dump;
 pub mod events;
+pub mod key;
 pub mod links;
 pub mod util;
 pub mod pq;

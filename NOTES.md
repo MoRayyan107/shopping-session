@@ -298,6 +298,39 @@ candidate in `native-target`, scorer flags (through `tests/scorer_run.sh`). Base
   Verified exact: 17 unit tests; every stage table + both outputs on all 61 datasets and on p20m.
   Parsing links inside the join branch was worse (the person map becomes the critical path); not kept.
 
+### 2. Exact 16-byte ID keys (`key.rs`): verified, committed
+
+**Where the time was** (warm p20m, `perf` in a privileged dev container, `tests` binary built with line tables
+into the `native-target-prof` volume; CPU time per stage from `/proc/self/stat` with `NATIVE_PROFILE=1`): every
+stage keeps the 8 threads 92-98% busy (CPU-bound, not waiting), 18.6 CPU-seconds in all. ~22% of all samples
+were `memcmp` and ~5% `memcpy`: comparing user/person IDs by their bytes in the input files, long after those
+lines left the cache. A person who is not renamed was named by the span of *their own event line*, so two events
+of one person had different spans, and `same_person` compared bytes at two cold places for every adjacent pair
+(sessions: 10.8% of all CPU), likewise `PersonTable::lookup` in dedup and clicks. The 8-byte line splitter
+(stash) gave nothing measurable (split 0.973 vs 0.978 s): finding `
+` / `,` / `"` is not where split's time goes.
+
+**The change.** A user or person is now a `Key` (two u64, 16 bytes, align 8): an ID of at most 15 bytes inline
+(bytes zero-padded big-endian, length in the lowest byte: equal keys <=> equal IDs, and keys order exactly as
+the bytes do), a longer ID a *canonical* span (the first span registered for those bytes, `Store::key`, a
+sharded mutex map; 0xFF in the lowest byte). So equal keys <=> equal IDs for every ID, and nothing reads the
+input to compare IDs. The bucket hash is a function of the key. Record sizes unchanged (event line 48 B, event
+40 B, click line 48 B, click 40 B, session 48 B, person slot 32 B): the 8-byte hash fields went. Sessions sort by
+(person key, ts): no collision check or re-sort any more. `NATIVE_KEY_INLINE_MAX=N` lowers the inline limit
+to push IDs through the long path (tested with 4: every 9-byte ID is long).
+
+| Run | `8b7df52` | exact keys |
+| --- | --- | --- |
+| p20m cold, whole run / pipeline | 3.29-3.48 / 2.81-3.00 s | **2.85-3.09 / 2.36-2.55 s** |
+| p20m warm, whole run / pipeline | 3.05-3.22 / 2.53-2.68 s | **2.40-2.58 / 1.95-2.09 s** |
+| p60m 12g cold | 11.0 s | **9.7 s**, MATCH, anon 5.99 GB |
+| p60m 10g cold | 18-20 s, ~100k major faults | **14.5 s**, 7.6k major faults, MATCH, anon 6.02 GB |
+
+Warm p20m stages: split 0.85 s, dedup 0.55 s, sessions 0.35 -> 0.16 s, clicks 0.30 s, credit 0.13 -> 0.07 s.
+Verified exact: 20 unit tests (incl. every ID up to 3 bytes over {0x00, a, b, 0xFF} for equality and order,
+random IDs of every length 0-15, canonical long keys); every stage table + outputs on all 61 datasets and p20m;
+the same with `NATIVE_KEY_INLINE_MAX=4` (61/61 + p20m); the side-store check `NATIVE_SPAN_MAX_LEN=4` (41/41).
+
 ### Environment
 
 - `D:` is a USB drive (WD P40) that Windows powers off when idle ("USB selective suspend"); each time, Docker
@@ -308,11 +341,12 @@ candidate in `native-target`, scorer flags (through `tests/scorer_run.sh`). Base
 - **The laptop goes into Modern Standby when idle, even mid-run**: the Docker VM freezes, a run's wall time grows
   by the standby (one p60m run: 768 s wall, 20.9 s by its own clock) and host-side timeouts do not fire. Before
   timing, keep it awake (`SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` in a background
-  PowerShell loop) and check `Kernel-Power` events 506/507 afterwards; discard any run that overlaps one.
+  PowerShell loop; `ES_SYSTEM_REQUIRED` alone did not stop it, `| ES_DISPLAY_REQUIRED` added) and check
+  `Kernel-Power` events 506/507 afterwards; a run that overlaps one shows wall time far over its pipeline time.
 
 ### Next
 
-Compute (warm p20m, read-ahead build): split + validate 0.95 s, dedup + person 0.59 s, sessions 0.38 s, clicks
-0.35 s, credit 0.13 s, write 0.09 s, total 2.57 s, plus ~0.45 s outside the pipeline. Split is ~350 ns per line
-on 8 threads: every line is scanned byte by byte for `\n`, then `,`, then `"` per field. Next: the 8-byte
-splitter (stash), then a per-stage timeline across the threads.
+Warm p20m now: split 0.85 s (the person map, 0.78 s on one thread, runs beside it and takes one of its 8
+threads), dedup 0.55 s, clicks 0.30 s, sessions 0.16 s, write 0.07 s, credit 0.07 s; ~0.45-0.5 s per run is
+outside the pipeline. Next: the person map on keys and in parallel; click_id spans from the line span (no
+`span_of` + cold line read per click); then dedup (sorts, copies, page faults).

@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use rayon::prelude::*;
 
 use crate::csv::{lines, split_line};
+use crate::key::Key;
 use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
@@ -68,8 +69,8 @@ fn pack_pk(price: u32, kind: u8) -> u32 {
 /// One valid event, mapped to its person (40 bytes). `line` is its raw line (used for dumps).
 #[derive(Clone, Copy)]
 pub struct Event {
-    pub person: Span,
-    pub phash: u64,
+    /// the person's exact key; its bucket is the top bits of `person.hash()`
+    pub person: Key,
     pub ts: i64,
     pub line: Span,
     price_kind: u32,
@@ -92,8 +93,8 @@ impl Event {
         f
     }
     #[cfg(test)]
-    pub fn test(person: Span, phash: u64, ts: i64, price: u32, kind: u8) -> Event {
-        Event { person, phash, ts, line: Span::EMPTY, price_kind: pack_pk(price, kind), cat: 0 }
+    pub fn test(person: Key, ts: i64, price: u32, kind: u8) -> Event {
+        Event { person, ts, line: Span::EMPTY, price_kind: pack_pk(price, kind), cat: 0 }
     }
 }
 
@@ -101,9 +102,9 @@ impl Event {
 #[derive(Clone, Copy)]
 pub struct Rec {
     idhash: u64,
-    uhash: u64,
+    /// the user ID's exact key (the default key when the copy is invalid)
+    user: Key,
     line: Span,
-    user: Span,
     ts: i64,
     price_kind: u32,
     cat: u32,
@@ -173,18 +174,16 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
                 let rec = match validate(&f, ws, we) {
                     Some((user, product, ts, price, kind)) => Rec {
                         idhash,
-                        uhash: hash_bytes(user),
+                        user: store.key(file, user),
                         line: line_sp,
-                        user: store.span(file, user),
                         ts,
                         price_kind: pack_pk(price, kind),
                         cat: cats.product.get(product).copied().unwrap_or(cats.unknown),
                     },
                     None => Rec {
                         idhash,
-                        uhash: 0,
+                        user: Key::default(),
                         line: line_sp,
-                        user: Span::EMPTY,
                         ts: 0,
                         price_kind: pack_pk(0, INVALID),
                         cat: 0,
@@ -215,8 +214,8 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                 let mut kept = 0usize;
                 let emit = |r: &Rec, events: &mut Vec<Event>| {
                     if (r.price_kind >> 24) as u8 != INVALID {
-                        let (person, phash) = ptab.lookup(r.uhash, r.user, store);
-                        events.push(Event { person, phash, ts: r.ts, line: r.line, price_kind: r.price_kind, cat: r.cat });
+                        let person = ptab.lookup(r.user);
+                        events.push(Event { person, ts: r.ts, line: r.line, price_kind: r.price_kind, cat: r.cat });
                     }
                 };
                 let (alone, groups) = dedup_groups(&order);
@@ -245,7 +244,7 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                         }
                     }
                 }
-                (kept, sort_by_bucket(events, |e| bucket(e.phash)))
+                (kept, sort_by_bucket(events, |e| bucket(e.person.hash())))
             },
         )
         .collect();
@@ -267,9 +266,9 @@ mod tests {
     }
     #[test]
     fn price_kind_packing() {
-        let e = Event::test(Span::EMPTY, 0, 0, 10_000_000, PURCHASE);
+        let e = Event::test(Key::default(), 0, 10_000_000, PURCHASE);
         assert_eq!((e.price(), e.kind()), (10_000_000, PURCHASE));
-        let e = Event::test(Span::EMPTY, 0, 0, 0, VIEW);
+        let e = Event::test(Key::default(), 0, 0, VIEW);
         assert_eq!((e.price(), e.kind()), (0, VIEW));
         assert_eq!((pack_pk(0, INVALID) >> 24) as u8, INVALID);
     }

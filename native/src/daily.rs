@@ -4,12 +4,13 @@ use rayon::prelude::*;
 use crate::clicks::{key, Campaigns, Credit};
 use crate::events::{Categories, PURCHASE};
 use crate::pq::{write_table, Col, USER_DAILY};
-use crate::sessions::{same_person, Part};
-use crate::span::{Span, Store};
+use crate::key::Key;
+use crate::sessions::Part;
+use crate::span::Store;
 use crate::util::FxMap;
 
 pub struct UserDay<'a> {
-    pub user: Span,
+    pub user: Key,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -18,7 +19,7 @@ pub struct UserDay<'a> {
 }
 
 /// One row per (person, day of session start).
-pub fn user_daily<'a>(store: &Store<'_>, parts: &[Part], cats: &Categories<'a>) -> Vec<Vec<UserDay<'a>>> {
+pub fn user_daily<'a>(parts: &[Part], cats: &Categories<'a>) -> Vec<Vec<UserDay<'a>>> {
     parts
         .par_iter()
         .map(|p| {
@@ -27,10 +28,10 @@ pub fn user_daily<'a>(store: &Store<'_>, parts: &[Part], cats: &Categories<'a>) 
             let ss = &p.sessions;
             let mut i = 0;
             while i < ss.len() {
-                let (person, day) = ((ss[i].phash, ss[i].person), ss[i].day);
-                let mut row = UserDay { user: person.1, day, sessions: 0, events: 0, revenue: 0, top: None };
+                let (person, day) = (ss[i].person, ss[i].day);
+                let mut row = UserDay { user: person, day, sessions: 0, events: 0, revenue: 0, top: None };
                 amounts.clear();
-                while i < ss.len() && ss[i].day == day && same_person(store, (ss[i].phash, ss[i].person), person) {
+                while i < ss.len() && ss[i].day == day && ss[i].person == person {
                     let s = &ss[i];
                     row.sessions += 1;
                     row.events += s.n_events as i64;
@@ -63,7 +64,7 @@ pub fn user_daily<'a>(store: &Store<'_>, parts: &[Part], cats: &Categories<'a>) 
 pub fn user_daily_cols(store: &Store<'_>, rows: &[Vec<UserDay<'_>>]) -> Vec<Col> {
     let all = || rows.iter().flatten();
     vec![
-        Col::Str(all().map(|r| store.get(r.user).to_vec()).collect()),
+        Col::Str(all().map(|r| r.user.to_vec(store)).collect()),
         Col::Date(all().map(|r| r.day).collect()),
         Col::I64(all().map(|r| r.sessions).collect()),
         Col::I64(all().map(|r| r.events).collect()),
