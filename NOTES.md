@@ -126,6 +126,10 @@ from the Docker volume `vol_p20m`.
 | Native stage | Tables | Result |
 | ------------ | ------ | ------ |
 | 1 Parse | `raw_events`, `raw_clicks`, `links` | match on all 61 datasets and on `p20m` |
+| 2 Events dedup + validate + late | `ev_valid` | match on all 61 datasets and on `p20m` (19,649,172 rows) |
+
+Native timings at 20M (in Docker, 8 threads, dumps excluded): parse events 1.31 s, clicks 0.20 s, events
+dedup 0.92 s (hash-partitioned, 256 parts), validate + late 0.38 s. To optimise once everything matches.
 
 ## Next
 

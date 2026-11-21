@@ -2,6 +2,8 @@
 //! every function here mirrors a rule implemented and tested there.
 pub mod csv;
 pub mod dump;
+pub mod events;
+pub mod util;
 pub mod pq;
 pub mod raw;
 pub mod ts;

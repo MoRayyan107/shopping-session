@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
+use shopping_sessions_native::events;
+use shopping_sessions_native::pq::Col;
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
 
@@ -67,6 +69,27 @@ fn main() {
     dump.raw("links", ["user_id_a", "user_id_b"], &links);
     if dump.on() {
         clock.lap("dump stage 1", "raw_events, raw_clicks, links");
+    }
+
+    // Stage 2: events dedup, validate, late filter
+    let kept = events::dedup(&raw_events);
+    clock.lap("events dedup", kept.len());
+    let ev = events::validate(&raw_events, &kept, ws, we);
+    clock.lap("events validate + late", ev.len());
+    if dump.on() {
+        dump.table(
+            "ev_valid",
+            "message ev_valid { OPTIONAL BYTE_ARRAY user_id (STRING); OPTIONAL INT64 ts_ms; \
+             OPTIONAL BYTE_ARRAY event_type (STRING); OPTIONAL BYTE_ARRAY product_id (STRING); OPTIONAL INT64 price_cents; }",
+            vec![
+                Col::OptStr(ev.iter().map(|e| Some(e.user.to_vec())).collect()),
+                Col::OptI64(ev.iter().map(|e| Some(e.ts)).collect()),
+                Col::OptStr(ev.iter().map(|e| Some(events::TYPE_NAMES[e.kind as usize].to_vec())).collect()),
+                Col::OptStr(ev.iter().map(|e| Some(e.product.to_vec())).collect()),
+                Col::OptI64(ev.iter().map(|e| (e.kind == events::PURCHASE).then_some(e.price)).collect()),
+            ],
+        );
+        clock.lap("dump stage 2", "ev_valid");
     }
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());
