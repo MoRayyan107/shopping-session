@@ -231,6 +231,10 @@ run). p20m: cold 3.70 s, warm 2.53 / 2.45 s (wall 2.98 / 2.86 s), anon 1.9 GB (`
 Re-verified on this exact code: 17 unit tests, all 61 datasets and p20m on every stage table + outputs, the
 side-store check (41/41).
 
+**Commit `dcc09e9a7e5c254b8d65cd3fc625b094c8d8c381` (tag `memory-v1`, branches `memory` and `main`).** Fresh-clone
+proof passed: clone from GitHub, checkout, `--no-cache` build 29 s, 36/36 fixtures, dev MATCH (2.85 s), p20m MATCH
+(2.51 s, anon 1.9 GB).
+
 Earlier, with mallopt: p60m 12g exit 0, pipeline 13.1 s, anon peak 5.68 GB, `memory.peak`
 10.67 GB (4.9 GB of it input cache), MATCH. 10g exit 0, 10.8 s, MATCH. **8g does not finish** (stopped at
 400 s, 340k major faults): anon ~4.3 GB plus ~4.5 GB of input pages do not fit in 8 GiB, and dedup and sessions
