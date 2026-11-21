@@ -37,20 +37,30 @@ def load_table(con, table, path_glob, columns):
                     + ", ".join(f"NULL::VARCHAR AS {c}" for c in columns) + " WHERE false")
         return 0
     quoted_glob = path_glob.replace("'", "''")
+    # Three materialised steps, because DuckDB parallelises a query by chunks of its source rows:
+    #   1. one row per file: its lines as a list
+    #   2. one row per line (unnest; the header line of each file is dropped)
+    #   3. the dialect check and field split, which now reads a many-row table and runs on every thread.
+    # Fed straight from the unnest, step 3 ran on one thread whatever the setting (3.3 s vs 0.7 s at 8 threads
+    # on 3.2M lines).
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE {table}__files AS
+        SELECT string_split(content, chr(10)) AS parts FROM read_text('{quoted_glob}')
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE {table}__lines AS
+        SELECT unnest(parts[2:]) AS line FROM {table}__files
+    """)
+    con.execute(f"DROP TABLE {table}__files")
     con.execute(f"""
         CREATE OR REPLACE TABLE {table} AS
-        WITH files AS (
-            SELECT string_split(content, chr(10)) AS parts FROM read_text('{quoted_glob}')
-        ),
-        lines AS (                                                   -- drop each file's header line
-            SELECT unnest(parts[2:]) AS line FROM files
-        ),
-        split AS (
-            SELECT string_split(line, ',') AS p FROM lines WHERE line <> ''
+        WITH split AS (
+            SELECT string_split(line, ',') AS p FROM {table}__lines WHERE line <> ''
         )
         SELECT {select_cols}
         FROM split
         WHERE len(p) = {ncols}
           AND len(list_filter(p, x -> NOT regexp_full_match(x, '{FIELD_RE}'))) = 0
     """)
+    con.execute(f"DROP TABLE {table}__lines")
     return con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
