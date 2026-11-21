@@ -57,8 +57,11 @@ def run_native(names, work, ncpu, tables):
 
 
 def diff_table(con, native, oracle, show=3):
-    if not native.exists():
-        return False, f"native dump missing: {native.name}"
+    """native/oracle: a Parquet file, or a folder (all its *.parquet files)."""
+    if not native.exists() or (native.is_dir() and not any(native.glob("*.parquet"))):
+        return False, f"native table missing: {native.name}"
+    native = native / "*.parquet" if native.is_dir() else native
+    oracle = oracle / "*.parquet" if oracle.is_dir() else oracle
     ocols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{oracle.as_posix()}')").fetchall()
     ncols = {c[0] for c in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{native.as_posix()}')").fetchall()}
     if ncols != {c[0] for c in ocols}:
@@ -106,13 +109,7 @@ def main():
                 lines.append(f"    {t}: {msg}")
             if a.outputs:
                 for t in ("user_daily", "campaign_daily"):
-                    nat = sorted((work / safe / "out" / t).glob("*.parquet"))
-                    ora = sorted((ORACLE_OUT / n / t).glob("*.parquet"))
-                    if not nat:
-                        ok = False
-                        lines.append(f"    output {t}: missing")
-                        continue
-                    good, msg = diff_table(con, nat[0], ora[0])
+                    good, msg = diff_table(con, work / safe / "out" / t, ORACLE_OUT / n / t)
                     ok &= good
                     lines.append(f"    output {t}: {msg}")
         bad += not ok

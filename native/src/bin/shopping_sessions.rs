@@ -251,7 +251,9 @@ fn main() {
         std::fs::create_dir_all(out.join(t)).expect("create output folder");
     }
     std::thread::scope(|s| {
-        s.spawn(|| daily::write_user_daily(&out.join("user_daily/part-0.parquet"), &ud).expect("write user_daily"));
+        s.spawn(|| {
+            daily::write_user_daily(&out.join("user_daily"), &ud, rayon::current_num_threads()).expect("write user_daily")
+        });
         s.spawn(|| {
             write_table(&out.join("campaign_daily/part-0.parquet"), CAMPAIGN_DAILY, daily::campaign_daily_cols(&cd))
                 .expect("write campaign_daily")

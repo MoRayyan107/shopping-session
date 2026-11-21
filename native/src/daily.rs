@@ -137,6 +137,13 @@ pub fn campaign_daily_cols(rows: &[CampaignDay<'_>]) -> Vec<Col> {
     ]
 }
 
-pub fn write_user_daily(path: &std::path::Path, rows: &[Vec<UserDay<'_>>]) -> parquet::errors::Result<()> {
-    write_table(path, USER_DAILY, user_daily_cols(rows))
+/// user_daily as `nfiles` part files written in parallel (rules.md: file count does not matter); every file
+/// is written, even an empty one, so the folder always holds at least one.
+pub fn write_user_daily(dir: &std::path::Path, rows: &[Vec<UserDay<'_>>], nfiles: usize) -> parquet::errors::Result<()> {
+    let nfiles = nfiles.clamp(1, rows.len().max(1));
+    let per = rows.len().div_ceil(nfiles).max(1);
+    (0..nfiles).into_par_iter().try_for_each(|f| {
+        let group = &rows[(f * per).min(rows.len())..((f + 1) * per).min(rows.len())];
+        write_table(&dir.join(format!("part-{f}.parquet")), USER_DAILY, user_daily_cols(group))
+    })
 }
