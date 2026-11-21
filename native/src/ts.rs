@@ -59,7 +59,34 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') {
         return parse_f2(s.try_into().unwrap());
     }
+    if s.len() == 13 {
+        return parse_f3_13(s.try_into().unwrap());
+    }
     parse_ts_general(s)
+}
+
+/// The value of eight ASCII digits (byte 0 most significant), given as the word XOR `0` bytes (each byte
+/// 0..=9): pairs, then fours, then the eight.
+#[inline(always)]
+fn eight_digits(d: u64) -> u64 {
+    // each step: lane j becomes 100 * lane j + lane j + 1 (or 10_000 *), every lane stays below its width
+    let d = pairs(d) & 0x00FF_00FF_00FF_00FF;
+    let d = (d.wrapping_mul(1 + (100 << 16)) >> 16) & 0x0000_FFFF_0000_FFFF;
+    d.wrapping_mul(1 + (10_000 << 32)) >> 32
+}
+
+/// A 13-byte value: F3 when all digits (13 digits never exceed 18 significant ones), else no form of 13 bytes
+/// exists, so `None`, exactly as `parse_ts_general`.
+#[inline(always)]
+fn parse_f3_13(s: &[u8; 13]) -> Option<i64> {
+    const ZEROS: u64 = 0x3030_3030_3030_3030;
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap()) ^ ZEROS;
+    let b = u64::from_le_bytes(s[5..13].try_into().unwrap()) ^ ZEROS;
+    if bad_bytes(a, !0) | bad_bytes(b, !0) != 0 {
+        return None;
+    }
+    // digits 0-7, then digits 5-12 of which the last five are digits 8-12
+    Some((eight_digits(a) * 100_000 + eight_digits(b) % 100_000) as i64)
 }
 
 /// F2 (`YYYY-MM-DDTHH:MM:SS+HH:MM` or `-HH:MM`) at fixed positions: the F1 checks on the first 19 bytes, then
@@ -210,7 +237,39 @@ mod tests {
         assert_eq!(parse_price(b"10000001"), None);
     }
 
-    /// The F1 fast path against the general path: every position mutated to digits, separators and others.
+    #[test]
+    fn f3_13_fast_equals_general() {
+        let bases: [&[u8; 13]; 4] = [b"1753012345678", b"0000000000000", b"9999999999999", b"0123456789012"];
+        for base in bases {
+            assert!(parse_ts(base).is_some());
+            assert_eq!(parse_ts(base), parse_ts_general(base));
+            for i in 0..13 {
+                for c in 0..=255u8 {
+                    let mut v = *base;
+                    v[i] = c;
+                    assert_eq!(parse_ts(&v), parse_ts_general(&v), "{:?}", String::from_utf8_lossy(&v));
+                    if i > 0 {
+                        for low in [0xFFu8, 0x8A, b':', b'/'] {
+                            let mut w = v;
+                            w[i - 1] = low;
+                            assert_eq!(parse_ts(&w), parse_ts_general(&w), "{:?}", String::from_utf8_lossy(&w));
+                        }
+                    }
+                }
+            }
+        }
+        // many values: every digit in every place
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let t = format!("{:013}", x % 10_000_000_000_000);
+            assert_eq!(parse_ts(t.as_bytes()), parse_ts_general(t.as_bytes()), "{t}");
+        }
+    }
+
+    /// The F2 fast path against the general path.
     #[test]
     fn f2_fast_equals_general() {
         let bases: [&[u8; 25]; 5] = [
@@ -250,6 +309,7 @@ mod tests {
         }
     }
 
+    /// The F1 fast path against the general path: every position mutated to digits, separators and others.
     #[test]
     fn f1_fast_equals_general() {
         let bases: [&[u8; 20]; 4] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"0001-01-01T00:00:00Z", b"9999-12-31T23:59:59Z"];
