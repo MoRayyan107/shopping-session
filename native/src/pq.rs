@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parquet::basic::Compression;
-use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::errors::Result;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
@@ -17,6 +17,8 @@ pub enum Col {
     OptStr(Vec<Option<Vec<u8>>>),
     Date(Vec<i32>),
     I64(Vec<i64>),
+    OptI64(Vec<Option<i64>>),
+    Bool(Vec<bool>),
 }
 
 impl Col {
@@ -26,6 +28,8 @@ impl Col {
             Col::OptStr(v) => v.len(),
             Col::Date(v) => v.len(),
             Col::I64(v) => v.len(),
+            Col::OptI64(v) => v.len(),
+            Col::Bool(v) => v.len(),
         }
     }
 }
@@ -61,6 +65,15 @@ pub fn write_table(path: &Path, message_type: &str, cols: &[Col]) -> Result<()> 
                 }
                 Col::I64(v) => {
                     col.typed::<Int64Type>().write_batch(&v[start..end], None, None)?;
+                }
+                Col::OptI64(v) => {
+                    let part = &v[start..end];
+                    let defs: Vec<i16> = part.iter().map(|s| s.is_some() as i16).collect();
+                    let vals: Vec<i64> = part.iter().flatten().copied().collect();
+                    col.typed::<Int64Type>().write_batch(&vals, Some(&defs), None)?;
+                }
+                Col::Bool(v) => {
+                    col.typed::<BoolType>().write_batch(&v[start..end], None, None)?;
                 }
             }
             col.close()?;

@@ -100,7 +100,39 @@ showed quadratic cost in a probe, linear once materialised.
 14.0 s, dedup 6.2 s, validate 27.0 s, before sessions. Extrapolated about 70 s at 20M locally and over the
 final's 3-minute cap at 60M. A native pipeline is needed, not just faster.
 
+## Native pipeline (`native/`, in progress; NOT the submission path)
+
+Rust 1.85 (`rust:1.85.0-slim-bookworm`, pinned by digest), crates locked: `memmap2 0.9.5`, `rayon 1.10.0`,
+`parquet 59.3.3` (low-level writer, default features off; 59.3.3 is the newest supporting Rust 1.85).
+`native/Dockerfile` is multi-stage (runtime `debian:bookworm-slim` by digest, uid 1000); a no-cache build
+takes about 26 s. The top-level `Dockerfile` (DuckDB) stays the submission image until the native pipeline
+matches everywhere and is faster.
+
+- Parser benchmark (`bench_parse`) at 20M events (1,659 MB), 8 threads, warm cache: 0.50-0.56 s, and it finds
+  exactly the oracle's 21,559,089 well-formed lines.
+- Parquet output checked with polars (Date), DuckDB (DATE; INT32 DateType) and the scorer's loader.
+
+**Oracle cache** (outside the repo, `../data/`): `oracle/<name>/` final tables and `oracle_dumps/<name>/` stage
+dumps, built from a worktree pinned at the oracle commit by `tests/build_oracle.py`, plus `ev_valid`
+(`tests/oracle_ev_valid.py`, the oracle's own `build_events`). Datasets: the 36 fixtures (`fx/<CASE>`),
+`dev`, `big3x`, `s2`, `s4`, `s15`, 20 small seeds in `small/` (leap-day windows 62, 249 (Feb 29 is the last
+day), 254, 272, 355; year-crossing 133, 188, 256, 419 (ends 2026-01-01); 100-110; 30k to 300k events), and
+`p20m` (seed 3, 20M events, 1.8 GB; the oracle took 184 s with dumps).
+
+**Check**: `tests/native_check.py --tables T1,T2 [--outputs] ALL` runs the native binary in a linux/amd64
+container and diffs each stage table against the oracle dump exactly (EXCEPT ALL both ways). `p20m` is read
+from the Docker volume `vol_p20m`.
+
+| Native stage | Tables | Result |
+| ------------ | ------ | ------ |
+| 1 Parse | `raw_events`, `raw_clicks`, `links` | match on all 61 datasets and on `p20m` |
+
 ## Next
+
+Native stages 2-7: dedup + validate + late, linked IDs, sessions, `user_daily`, clicks + credit + assists,
+`campaign_daily` + Parquet output, each diffed against the oracle before it is committed.
+
+## Earlier plan
 
 A design (for approval) for a native Rust pipeline. The practice data is about 20M events, the leaders are
 at 1 to 1.5 s, and the final is about 60M events with a 3-minute cap.

@@ -17,7 +17,12 @@ path = "src/bin/bench_parse.rs"
 name = "parquet_probe"
 path = "src/bin/parquet_probe.rs"
 
+[[bin]]
+name = "shopping_sessions"
+path = "src/bin/shopping_sessions.rs"
+
 [dependencies]
+rayon = "=1.10.0"
 memmap2 = "=0.9.5"
 # Low-level column writer only: no arrow, no compression codecs. 59.3.3 is the newest that supports Rust 1.85.
 parquet = { version = "=59.3.3", default-features = false }
