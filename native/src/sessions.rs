@@ -55,6 +55,38 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev<'a>(person: &'a [u8], phash: u64, ts: i64) -> Event<'a> {
+        Event { person, phash, ts, line: b"", price: 0, cat: 0, kind: 0 }
+    }
+
+    #[test]
+    fn colliding_person_hashes_never_merge() {
+        // two persons with the same (forced) hash, interleaved in time, plus one other person
+        let v = vec![ev(b"b", 7, 30), ev(b"a", 7, 10), ev(b"c", 1, 5), ev(b"b", 7, 20), ev(b"a", 7, 40), ev(b"a", 7, 25)];
+        let parts = sessionize(vec![v]);
+        let p = &parts[0];
+        // each person's events contiguous and in ts order
+        let seq: Vec<(&[u8], i64)> = p.events.iter().map(|e| (e.person, e.ts)).collect();
+        assert_eq!(seq, vec![(&b"c"[..], 5), (b"a", 10), (b"a", 25), (b"a", 40), (b"b", 20), (b"b", 30)]);
+        // gaps are ms here, far under 30 minutes: one session per person, never one across persons
+        let s: Vec<(&[u8], u32)> = p.sessions.iter().map(|s| (s.person, s.n_events)).collect();
+        assert_eq!(s, vec![(&b"c"[..], 1), (b"a", 3), (b"b", 2)]);
+    }
+
+    #[test]
+    fn gap_rule() {
+        let v = vec![ev(b"a", 1, 0), ev(b"a", 1, GAP_MS), ev(b"a", 1, 2 * GAP_MS + 1), ev(b"a", 1, 2 * GAP_MS + 1)];
+        let parts = sessionize(vec![v]);
+        let s: Vec<(i64, u32)> = parts[0].sessions.iter().map(|s| (s.start, s.n_events)).collect();
+        // a gap of exactly 30 minutes stays in the session; equal timestamps always share one
+        assert_eq!(s, vec![(0, 2), (2 * GAP_MS + 1, 2)]);
+    }
+}
+
 pub fn sessionize(by_person: Vec<Vec<Event<'_>>>) -> Vec<Part<'_>> {
     by_person
         .into_par_iter()

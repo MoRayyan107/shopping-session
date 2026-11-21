@@ -9,7 +9,7 @@ use crate::links::PersonTable;
 use crate::raw::{pieces, Mapped, Row};
 use crate::sessions::{group_by_person, Part};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, hash_bytes, transpose_concat, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, transpose_concat, FxMap, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -135,8 +135,8 @@ pub fn build<'a>(files: &'a Mapped, ptab: &PersonTable<'a>, camps: &Campaigns<'a
     // pass 2: dedup each id bucket; kept valid clicks go to person buckets
     let out: Vec<Vec<Vec<Click<'a>>>> = by_id
         .into_par_iter()
-        .map(|mut recs| {
-            recs.sort_unstable_by_key(|r| r.idhash);
+        .map(|recs| {
+            let order = dedup_order(recs.len(), |i| recs[i].idhash);
             let mut buckets: Vec<Vec<Click<'a>>> =
                 (0..nparts).map(|_| Vec::with_capacity(recs.len() / nparts + 16)).collect();
             let emit = |r: &Rec<'a>, buckets: &mut Vec<Vec<Click<'a>>>| {
@@ -145,31 +145,29 @@ pub fn build<'a>(files: &'a Mapped, ptab: &PersonTable<'a>, camps: &Campaigns<'a
                     buckets[bucket(phash)].push(Click { person, phash, click_id: r.id, camp: r.camp, ts: r.ts });
                 }
             };
-            let mut i = 0;
-            while i < recs.len() {
-                let mut j = i + 1;
-                while j < recs.len() && recs[j].idhash == recs[i].idhash {
-                    j += 1;
+            let (alone, groups) = dedup_groups(&order);
+            // unique ids in memory order (sequential reads), then the groups of copies
+            for (i, r) in recs.iter().enumerate() {
+                if alone[i] {
+                    emit(r, &mut buckets);
                 }
-                if j == i + 1 {
-                    emit(&recs[i], &mut buckets);
-                } else {
-                    // copies of one click_id (or a hash collision): order by (click_id, the oracle's copy order)
-                    let mut g: Vec<(Row<'a, 4>, usize)> = (i..j)
-                        .map(|k| {
-                            let mut f = [None; 4];
-                            split_line(recs[k].line, &mut f);
-                            (f, k)
-                        })
-                        .collect();
-                    g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
-                    for (n, (row, k)) in g.iter().enumerate() {
-                        if n == 0 || g[n - 1].0[0] != row[0] {
-                            emit(&recs[*k], &mut buckets);
-                        }
+            }
+            for grp in &groups {
+                // copies of one id (or a hash collision): order by (id, the oracle's copy order)
+                let mut g: Vec<(Row<'a, 4>, usize)> = grp
+                    .iter()
+                    .map(|&k| {
+                        let mut f = [None; 4];
+                        split_line(recs[k].line, &mut f);
+                        (f, k)
+                    })
+                    .collect();
+                g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
+                for (n, (row, k)) in g.iter().enumerate() {
+                    if n == 0 || g[n - 1].0[0] != row[0] {
+                        emit(&recs[*k], &mut buckets);
                     }
                 }
-                i = j;
             }
             buckets
         })

@@ -16,26 +16,37 @@ struct Slot<'a> {
 pub struct PersonTable<'a> {
     mask: usize,
     slots: Vec<Option<Slot<'a>>>,
+    /// one bit per (hash >> 32) & bit_mask: set for every renamed ID; a clear bit means "not renamed"
+    bits: Vec<u64>,
+    bit_mask: usize,
 }
 
 impl<'a> PersonTable<'a> {
     pub fn new(map: &FxMap<&'a [u8], &'a [u8]>) -> PersonTable<'a> {
         let cap = (map.len() * 2).next_power_of_two().max(16);
+        let nbits = (map.len() * 16).next_power_of_two().max(64);
         let mut slots: Vec<Option<Slot<'a>>> = vec![None; cap];
+        let mut bits = vec![0u64; nbits / 64];
         for (&id, &person) in map {
             let hash = hash_bytes(id);
+            let b = (hash >> 32) as usize & (nbits - 1);
+            bits[b / 64] |= 1 << (b % 64);
             let mut i = hash as usize & (cap - 1);
             while slots[i].is_some() {
                 i = (i + 1) & (cap - 1);
             }
             slots[i] = Some(Slot { hash, id, person, phash: hash_bytes(person) });
         }
-        PersonTable { mask: cap - 1, slots }
+        PersonTable { mask: cap - 1, slots, bits, bit_mask: nbits - 1 }
     }
 
     /// (person, hash of person) for a user ID whose hash_bytes() is `uhash`.
     #[inline]
     pub fn lookup(&self, uhash: u64, user: &'a [u8]) -> (&'a [u8], u64) {
+        let b = (uhash >> 32) as usize & self.bit_mask;
+        if self.bits[b / 64] & (1 << (b % 64)) == 0 {
+            return (user, uhash);
+        }
         let mut i = uhash as usize & self.mask;
         while let Some(s) = &self.slots[i] {
             if s.hash == uhash && s.id == user {

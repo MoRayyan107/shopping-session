@@ -13,7 +13,7 @@ use crate::csv::{lines, split_line};
 use crate::links::PersonTable;
 use crate::raw::{pieces, Mapped, Row};
 use crate::ts::{parse_price, parse_ts};
-use crate::util::{cmp_nulls_last, hash_bytes, transpose_concat, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_groups, dedup_order, hash_bytes, prof, transpose_concat, FxMap, PART_BITS};
 
 pub const VIEW: u8 = 0;
 pub const CART: u8 = 1;
@@ -140,6 +140,7 @@ fn bucket(h: u64) -> usize {
 /// Pass 1: split + validate every line into buckets by hash(event_id).
 pub fn split<'a>(files: &'a Mapped, cats: &Categories<'a>, ws: i64, we: i64) -> Vec<Vec<Rec<'a>>> {
     let nparts = 1usize << PART_BITS;
+    let mut t = std::time::Instant::now();
     let blocks: Vec<Vec<Vec<Rec<'a>>>> = pieces(files)
         .par_iter()
         .map(|piece| {
@@ -169,16 +170,20 @@ pub fn split<'a>(files: &'a Mapped, cats: &Categories<'a>, ws: i64, we: i64) -> 
             out
         })
         .collect();
-    transpose_concat(blocks)
+    prof("events: split + validate into blocks", &mut t);
+    let r = transpose_concat(blocks);
+    prof("events: concat id buckets", &mut t);
+    r
 }
 
 /// Pass 2: dedup each id bucket; kept valid events go to buckets by hash(person).
 pub fn dedup<'a>(by_id: Vec<Vec<Rec<'a>>>, ptab: &PersonTable<'a>) -> Built<'a> {
     let nparts = 1usize << PART_BITS;
+    let mut t = std::time::Instant::now();
     let out: Vec<(usize, Vec<Vec<Event<'a>>>)> = by_id
         .into_par_iter()
-        .map(|mut recs| {
-            recs.sort_unstable_by_key(|r| r.idhash);
+        .map(|recs| {
+            let order = dedup_order(recs.len(), |i| recs[i].idhash);
             let mut buckets: Vec<Vec<Event<'a>>> =
                 (0..nparts).map(|_| Vec::with_capacity(recs.len() / nparts + 16)).collect();
             let mut kept = 0usize;
@@ -196,37 +201,38 @@ pub fn dedup<'a>(by_id: Vec<Vec<Rec<'a>>>, ptab: &PersonTable<'a>) -> Built<'a> 
                     });
                 }
             };
-            let mut i = 0;
-            while i < recs.len() {
-                let mut j = i + 1;
-                while j < recs.len() && recs[j].idhash == recs[i].idhash {
-                    j += 1;
-                }
-                if j == i + 1 {
+            let (alone, groups) = dedup_groups(&order);
+            // unique ids in memory order (sequential reads), then the groups of copies
+            for (i, r) in recs.iter().enumerate() {
+                if alone[i] {
                     kept += 1;
-                    emit(&recs[i], &mut buckets);
-                } else {
-                    // copies of one event_id (or a hash collision): order by (event_id, the oracle's copy order)
-                    let mut g: Vec<(Row<'a, 7>, usize)> = (i..j)
-                        .map(|k| {
-                            let mut f = [None; 7];
-                            split_line(recs[k].line, &mut f);
-                            (f, k)
-                        })
-                        .collect();
-                    g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
-                    for (n, (row, k)) in g.iter().enumerate() {
-                        if n == 0 || g[n - 1].0[0] != row[0] {
-                            kept += 1;
-                            emit(&recs[*k], &mut buckets);
-                        }
+                    emit(r, &mut buckets);
+                }
+            }
+            for grp in &groups {
+                // copies of one id (or a hash collision): order by (id, the oracle's copy order)
+                let mut g: Vec<(Row<'a, 7>, usize)> = grp
+                    .iter()
+                    .map(|&k| {
+                        let mut f = [None; 7];
+                        split_line(recs[k].line, &mut f);
+                        (f, k)
+                    })
+                    .collect();
+                g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
+                for (n, (row, k)) in g.iter().enumerate() {
+                    if n == 0 || g[n - 1].0[0] != row[0] {
+                        kept += 1;
+                        emit(&recs[*k], &mut buckets);
                     }
                 }
-                i = j;
             }
             (kept, buckets)
         })
         .collect();
+    prof("events: sort + dedup + person", &mut t);
     let kept = out.iter().map(|o| o.0).sum();
-    Built { by_person: transpose_concat(out.into_iter().map(|o| o.1).collect()), kept }
+    let by_person = transpose_concat(out.into_iter().map(|o| o.1).collect());
+    prof("events: concat person buckets", &mut t);
+    Built { by_person, kept }
 }

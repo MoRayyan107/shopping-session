@@ -66,12 +66,18 @@ fn main() {
     clock.lap("parse links, products, campaigns", format!("{} / {} / {}", links.len(), products.len(), campaigns.len()));
     // Stage 2 pass 1 (split + validate events) runs while one thread does stage 3 (linked IDs)
     let cats = events::Categories::new(&products);
-    let (ev_split, pmap) = rayon::join(|| events::split(&ev_files, &cats, ws, we), || links::person_map(&links));
+    let (ev_split, (pmap, ptab)) = rayon::join(
+        || events::split(&ev_files, &cats, ws, we),
+        || {
+            let m = links::person_map(&links);
+            let t = links::PersonTable::new(&m);
+            (m, t)
+        },
+    );
     clock.lap(
         "events split + validate | linked IDs",
         format!("{} lines | {} renamed IDs", ev_split.iter().map(Vec::len).sum::<usize>(), pmap.len()),
     );
-    let ptab = links::PersonTable::new(&pmap);
     let built = events::dedup(ev_split, &ptab);
     clock.lap(
         "events dedup + person",
