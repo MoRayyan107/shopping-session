@@ -217,7 +217,7 @@ pub fn build<'a>(
     let by_id = Chunks::new(scatters);
     // pass 2: dedup each id bucket (freed once done); kept valid clicks go straight to their person bucket
     let ids: Vec<usize> = (0..NPARTS).collect();
-    type State = (Vec<Rec>, Vec<u64>, Scatter<Click>, Groups, Vec<usize>);
+    type State = (Vec<Rec>, Vec<u32>, Scatter<Click>, Groups, Vec<usize>);
     let states = for_each_in_order(
         &ids,
         || (Vec::new(), Vec::new(), Scatter::default(), Groups::default(), Vec::new()),

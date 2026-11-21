@@ -106,12 +106,15 @@ pub fn dedup_order(n: usize, idhash: impl Fn(usize) -> u64) -> Vec<u64> {
     keys
 }
 
-/// The same answer as `dedup_groups(&dedup_order(n, idhash))`, by hashing instead of sorting: which rows are
-/// alone in their group, and the groups of 2 or more (rows with equal truncated id hash, the same 40 bits
-/// as `dedup_order`'s keys), each group in row order. `table` is scratch, reused across calls.
-/// An open-addressing table of (truncated hash, first row + 1) finds each row's group in one probe sequence;
-/// later rows of a group are only listed, so the table never holds two slots of one group.
-pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u64>) -> (Vec<bool>, Vec<Vec<usize>>) {
+/// Candidate copy groups by hashing: which rows are alone, and the groups of 2 or more, each in row order.
+/// Every class of rows with equal truncated id hash (the 40 bits of `dedup_order`'s keys) lies inside one
+/// group and every group is a union of such classes; a group may join classes whose hashes agree only in
+/// the bits a 4-byte slot keeps. Callers split each group by the real ids, so an extra class in a group
+/// costs a comparison, never a wrong merge. `table` is scratch, reused across calls.
+/// An open-addressing table of 4-byte slots (high: hash bits, low: first row + 1) finds each row's group in
+/// one probe sequence (rows with equal 40-bit hashes follow the same sequence past the same occupied,
+/// non-matching slots, so they meet at one slot); later rows of a group are only listed.
+pub fn dedup_find(n: usize, idhash: impl Fn(usize) -> u64, table: &mut Vec<u32>) -> (Vec<bool>, Vec<Vec<usize>>) {
     let mut g = Groups::default();
     dedup_find_into(n, (0..n).map(idhash), table, &mut g);
     let groups = (0..g.len()).map(|i| g.group(i).iter().map(|&k| k as usize).collect()).collect();
@@ -142,9 +145,13 @@ impl Groups {
 
 /// `dedup_find` into `g`, with no allocation once the buffers have grown.
 /// `hashes` gives row i's id hash, for i in 0..n in order (exactly n of them).
-pub fn dedup_find_into(n: usize, hashes: impl Iterator<Item = u64>, table: &mut Vec<u64>, g: &mut Groups) {
+pub fn dedup_find_into(n: usize, hashes: impl Iterator<Item = u64>, table: &mut Vec<u32>, g: &mut Groups) {
     assert!(n < (1 << IDX_BITS) - 1, "a dedup bucket holds {n} rows, more than 2^{IDX_BITS} - 2");
     let mask = (1u64 << IDX_BITS) - 1;
+    // a slot: the row + 1 in its low `ib` bits (enough for n), the top 32 - ib (>= 8) bits of the 40-bit
+    // hash above them; 0 is empty
+    let ib = (64 - (n as u64).leading_zeros()).max(1);
+    let imask = (1u32 << ib) - 1;
     let bits = ((2 * n).max(16)).next_power_of_two().trailing_zeros();
     let cap = 1usize << bits;
     table.clear();
@@ -157,15 +164,16 @@ pub fn dedup_find_into(n: usize, hashes: impl Iterator<Item = u64>, table: &mut 
         seen += 1;
         // the same 40 bits as dedup_order: below the bucket bits, above the index bits
         let h = (idh << PART_BITS) & !mask;
+        let hb = ((h >> 32) as u32) & !imask;
         let mut pos = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         loop {
             let s = table[pos];
             if s == 0 {
-                table[pos] = h | (i as u64 + 1);
+                table[pos] = hb | (i as u32 + 1);
                 break;
             }
-            if s & !mask == h {
-                later.push((((s & mask) - 1) as u32, i as u32));
+            if s & !imask == hb {
+                later.push(((s & imask) - 1, i as u32));
                 break;
             }
             pos = (pos + 1) & (cap - 1);
@@ -239,23 +247,60 @@ mod tests {
         assert_eq!(alone, vec![false, false, false, true, false, false]);
     }
 
-    /// dedup_find gives exactly dedup_groups(dedup_order(..)): the same alone flags and the same groups,
-    /// each in row order (groups compared as a sorted list).
-    fn same_as_sorting(h: &[u64], table: &mut Vec<u64>) {
-        let (alone_s, mut groups_s) = dedup_groups(&dedup_order(h.len(), |i| h[i]));
-        let (alone_f, mut groups_f) = dedup_find(h.len(), |i| h[i], table);
-        assert_eq!(alone_s, alone_f);
-        for g in &groups_f {
-            assert!(g.windows(2).all(|w| w[0] < w[1]), "a group in row order");
+    /// dedup_find against dedup_groups(dedup_order(..)): every 40-bit class (a sorting group, or a row alone)
+    /// lies inside one found group or is alone there too, every found group is a union of classes, groups are
+    /// in row order and cover exactly the rows not alone.
+    fn same_as_sorting(h: &[u64], table: &mut Vec<u32>) {
+        let n = h.len();
+        let (alone_s, groups_s) = dedup_groups(&dedup_order(n, |i| h[i]));
+        let (alone_f, groups_f) = dedup_find(n, |i| h[i], table);
+        assert_eq!(alone_f.len(), n);
+        // class id of every row under sorting, group id under finding
+        let mut class = vec![usize::MAX; n];
+        for (c, g) in groups_s.iter().enumerate() {
+            for &k in g {
+                class[k] = c;
+            }
         }
-        groups_s.sort();
-        groups_f.sort();
-        assert_eq!(groups_s, groups_f);
+        let mut group = vec![usize::MAX; n];
+        for (j, g) in groups_f.iter().enumerate() {
+            assert!(g.len() >= 2 && g.windows(2).all(|w| w[0] < w[1]), "a group of 2+ in row order");
+            for &k in g {
+                assert_eq!(group[k], usize::MAX, "a row in two groups");
+                group[k] = j;
+            }
+        }
+        for i in 0..n {
+            assert_eq!(alone_f[i], group[i] == usize::MAX);
+            // a row in a 40-bit class is never alone, and its whole class is in its group
+            if !alone_s[i] {
+                assert!(!alone_f[i]);
+                for &k in &groups_s[class[i]] {
+                    assert_eq!(group[k], group[i]);
+                }
+            }
+        }
+        // the exact 40-bit classes reappear when only those classes are present (no two hashes that agree
+        // in the kept bits): checked by the forced-collision cases, whose groups must be exactly these
+        let _ = alone_s;
     }
 
     #[test]
     fn dedup_find_equals_sorting() {
-        let mut table = Vec::new();
+        let mut table: Vec<u32> = Vec::new();
+        // the forced collisions: exactly the 40-bit groups (their hashes differ in the kept bits)
+        {
+            let h = [0xAAu64 << 20, 1 << 60, 0xAA << 20, 0x55 << 20, (1 << 60) | 0xFFFF, 0xAA << 20];
+            let (alone, mut groups) = dedup_find(h.len(), |i| h[i], &mut table);
+            groups.sort();
+            assert_eq!(groups, vec![vec![0, 2, 5], vec![1, 4]]);
+            assert_eq!(alone, vec![false, false, false, true, false, false]);
+        }
+        // hashes equal in the kept top bits but different in the 40: may share a group, never split a class
+        {
+            let h: Vec<u64> = (0..2000u64).map(|i| (0xABCDu64 << 40) | ((i % 700) << 16)).collect();
+            same_as_sorting(&h, &mut table);
+        }
         // the forced collisions of the test above, and the empty case
         same_as_sorting(&[0xAAu64 << 20, 1 << 60, 0xAA << 20, 0x55 << 20, (1 << 60) | 0xFFFF, 0xAA << 20], &mut table);
         same_as_sorting(&[], &mut table);

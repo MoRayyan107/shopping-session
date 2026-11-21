@@ -222,7 +222,7 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
 pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built {
     let mut t = std::time::Instant::now();
     let ids: Vec<usize> = (0..NPARTS).collect();
-    type State = (Vec<u64>, Scatter<Event>, usize, Groups, Vec<(Rec, usize)>);
+    type State = (Vec<u32>, Scatter<Event>, usize, Groups, Vec<(Rec, usize)>);
     let states = for_each_in_order(
         &ids,
         || (Vec::new(), Scatter::default(), 0usize, Groups::default(), Vec::new()),
