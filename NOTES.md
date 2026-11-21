@@ -412,6 +412,30 @@ single and double byte mutation of four bases and every day of eight years); all
 61 datasets and p20m; the same with `NATIVE_SIMD=off` (61/61 and p20m); `NATIVE_KEY_INLINE_MAX=4` (61/61);
 side store (41/41).
 
+### Review for 0.3 s (2026-11-21): passes, floor, options (no code changed)
+
+Scorer: `53dd450` scored 2.47 s (local cold whole run 2.39-2.49 s, warm 2.00-2.03 s); `dcc09e9` 3.88 s
+(local cold 3.95-4.03, warm 3.00-3.05). Both fit "scorer = our cold whole run" and "scorer = 1.25 x our warm
+whole run"; one diagnostic submission (mincore on the input at start, sleep 1 s if resident) would tell which.
+
+Memory traffic at p20m today, ~19 GB in all (events ~16 GB, clicks ~2.5 GB) for 1.92 GB of input: each
+event's 64-byte record is written by the split, copied by `sort_by_bucket`, copied by the dedup gather and
+read again; each 40-byte event is written, copied by `sort_by_bucket`, copied by `into_vecs`, then sorted in
+place and read by sessions: about 900 bytes moved per 77-byte input line.
+
+Floor benchmark (worktree-only `bench_parse`, p20m events 1.66 GB, warm, in a container):
+
+| work | 8 threads | 4 threads |
+| --- | --- | --- |
+| AVX2 rows only (find every line and field) | 0.157 s | 0.251 s |
+| + all validation, both timestamps, keys | 0.255 s | 0.420 s |
+| + a 16-byte record per valid line into 256 buckets | 0.275 s | 0.615 s |
+| + a 64-byte record instead | 0.371 s | 0.646 s |
+
+Today's split stage is 0.57 s for the 64-byte case. An empty container costs 0.44 s here. Conclusion:
+0.3 s for the whole run is below the container start plus the byte scan on 4 cores (0.25 s) here; the
+realistic target is one shuffle of 16-32 byte records (option ranking in the report of 2026-11-21).
+
 **Fresh-clone proof of `53dd450bf3d15dc84feaf557dc7b46249644431e` (2026-11-21): passed.** Clone, checkout, clean
 tree, `--no-cache` build (`shopping-sessions:fresh-53dd450`), 36/36 fixtures, dev MATCH (pipeline 0.58 s),
 p20m scorer flags at 24g from `vol_p20m`: cold 2.56 s whole run / 1.94 s pipeline, warm 2.30 / 1.63 s, MATCH.
