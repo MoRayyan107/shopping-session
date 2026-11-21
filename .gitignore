@@ -31,3 +31,6 @@ generator/
 
 # native build output
 native/target/
+
+# any Rust build output
+target/

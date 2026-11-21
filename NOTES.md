@@ -2,7 +2,7 @@
 
 ## Status
 
-`oracle-v1` is the full DuckDB pipeline. Both tables match all 36 fixtures and the 1M-event dev answer exactly
+The submission image is the native pipeline (`Dockerfile`, see below). `oracle-v1` is the full DuckDB pipeline. Both tables match all 36 fixtures and the 1M-event dev answer exactly
 (`user_daily` 117,038 rows, `campaign_daily` 27,400 rows), both locally and in the scorer-style container.
 It is the **correctness oracle**: every faster version must match it exactly on every seed.
 
@@ -100,28 +100,47 @@ showed quadratic cost in a probe, linear once materialised.
 14.0 s, dedup 6.2 s, validate 27.0 s, before sessions. Extrapolated about 70 s at 20M locally and over the
 final's 3-minute cap at 60M. A native pipeline is needed, not just faster.
 
-## Native pipeline (`native/`, in progress; NOT the submission path)
+## Native pipeline (`native/`): the submission path
+
+The top-level `Dockerfile` builds the native pipeline from the repository root (only files in git; the build
+context is about 100 KB). The DuckDB pipeline stays as the fallback and correctness oracle: `Dockerfile.duckdb`
+(`docker buildx build --platform linux/amd64 -f Dockerfile.duckdb .`) and the tag `oracle-v1`.
 
 Rust 1.85 (`rust:1.85.0-slim-bookworm`, pinned by digest), crates locked: `memmap2 0.9.5`, `rayon 1.10.0`,
 `parquet 59.3.3` (low-level writer, default features off; 59.3.3 is the newest supporting Rust 1.85).
-`native/Dockerfile` is multi-stage (runtime `debian:bookworm-slim` by digest, uid 1000); a no-cache build
-takes about 26 s. The top-level `Dockerfile` (DuckDB) stays the submission image until the native pipeline
-matches everywhere and is faster.
+The `Dockerfile` is multi-stage (runtime `debian:bookworm-slim` by digest, uid 1000, no Python, only the
+`shopping_sessions` binary); a full no-cache build including crate downloads takes about 30 s.
 
-- Parser benchmark (`bench_parse`) at 20M events (1,659 MB), 8 threads, warm cache: 0.50-0.56 s, and it finds
-  exactly the oracle's 21,559,089 well-formed lines.
-- Parquet output checked with polars (Date), DuckDB (DATE; INT32 DateType) and the scorer's loader.
+How it works (`native/src/`):
+
+1. `raw.rs`, `csv.rs`: memory-map every file, cut into ~4 MB pieces at `\n`, the exact rules.md dialect.
+2. `events.rs` pass 1: one parallel pass splits **and validates** each line (validity depends only on the
+   copy), writing a compact record into one of 256 buckets by hash(event_id). Linked IDs (`links.rs`,
+   union-find, byte-wise smallest name) run on one thread meanwhile.
+3. `events.rs` pass 2: per bucket, sort one packed u64 per row (40 hash bits + index); rows alone in their
+   group are kept; groups of copies (or truncated-hash collisions) are re-split and resolved exactly by
+   (event_id, the oracle's copy order). Kept valid events go to 256 buckets by hash(person), via
+   `PersonTable` (precomputed hashes, a bit filter in front).
+4. `sessions.rs`: sort each person bucket by (person hash, ts); if two persons ever share a 64-bit hash
+   the bucket is re-sorted by the full person (unit-tested with forced collisions); 30-minute gap rule.
+5. `daily.rs`: `user_daily` from contiguous (person, day) runs; top category by interned id, ties by name.
+6. `clicks.rs`: the same split/dedup design, then credit and assists by one forward walk over each
+   bucket's sessions and clicks (same person hash buckets); campaigns interned (organic = the key
+   "organic", exactly as the oracle's string-keyed join).
+7. `campaign_daily`, self-check, Parquet: `user_daily` as NCPU part files written in parallel (rules.md:
+   file count does not matter), plain encoding, no compression.
 
 **Oracle cache** (outside the repo, `../data/`): `oracle/<name>/` final tables and `oracle_dumps/<name>/` stage
 dumps, built from a worktree pinned at the oracle commit by `tests/build_oracle.py`, plus `ev_valid`
 (`tests/oracle_ev_valid.py`, the oracle's own `build_events`). Datasets: the 36 fixtures (`fx/<CASE>`),
 `dev`, `big3x`, `s2`, `s4`, `s15`, 20 small seeds in `small/` (leap-day windows 62, 249 (Feb 29 is the last
-day), 254, 272, 355; year-crossing 133, 188, 256, 419 (ends 2026-01-01); 100-110; 30k to 300k events), and
-`p20m` (seed 3, 20M events, 1.8 GB; the oracle took 184 s with dumps).
+day), 254, 272, 355; year-crossing 133, 188, 256, 419 (ends 2026-01-01); 100-110; 30k to 300k events),
+`p20m` (seed 3, 20M events, 1.8 GB) and `p60m` (seed 5, 60M events, 15M clicks, 5.3 GB; final outputs only).
 
 **Check**: `tests/native_check.py --tables T1,T2 [--outputs] ALL` runs the native binary in a linux/amd64
-container and diffs each stage table against the oracle dump exactly (EXCEPT ALL both ways). `p20m` is read
-from the Docker volume `vol_p20m`.
+container and diffs each stage table against the oracle dump exactly (EXCEPT ALL both ways), and with
+`--outputs` the final folders. `p20m` is read from the Docker volume `vol_p20m`. `NATIVE_DUMP_DIR` /
+`NATIVE_DUMP_TABLES` turn on stage dumps; `NATIVE_PROFILE` logs sub-steps.
 
 | Native stage | Tables | Result |
 | ------------ | ------ | ------ |
@@ -133,15 +152,26 @@ from the Docker volume `vol_p20m`.
 | 6 Clicks dedup + validate + person, credit, assists | `ck_valid`, `session_credit`, `session_assist` | match on all 61 datasets and on `p20m` (4,938,185 clicks; 37,582,598 assists) |
 | 7 `campaign_daily`, self-checks, Parquet output | final `user_daily`, `campaign_daily` | match on all 61 datasets and on `p20m` (2,255,788 + 28,014 rows) |
 
-Native timings at 20M (in Docker, 8 threads, dumps excluded): parse events 1.31 s, clicks 0.20 s, events
-dedup 0.92 s (hash-partitioned, 256 parts), validate + late 0.38-0.67 s, linked IDs 0.46 s (one thread), sessions 2.02 s, user_daily 0.06 s, clicks 0.50 s, credit + assists 4.89 s (materialises 37.6M assist rows), campaign_daily 0.32 s, write
-Parquet 2.17 s. **First full native run at 20M: 14.1 s** (all stages exact; optimisation next). `NATIVE_DUMP_TABLES` limits which dumps are
-written. To optimise once everything matches.
+All tables were re-checked after every optimisation below (the latest: every stage table and both outputs,
+all 61 datasets, plus `p20m`).
 
-## Next
+**Scorer-style runs of the native image** (`scripts/docker_run.sh` flags: read-only root, 64 MB `/tmp`, no
+network, caps dropped, uid 1000, 8 CPUs; memory 12g because Docker Desktop here has ~15 GiB):
 
-Native stages 2-7: dedup + validate + late, linked IDs, sessions, `user_daily`, clicks + credit + assists,
-`campaign_daily` + Parquet output, each diffed against the oracle before it is committed.
+- `scripts/run_fixtures.py`: 36/36 fixtures pass.
+- dev: `scripts/compare.py` against `dev-answer`: MATCH. Pipeline 0.60-0.94 s warm (DuckDB: 3.8 s).
+- p20m (data in a Docker volume, the closest to a local Linux disk): pipeline 2.58-2.84 s, whole
+  `docker run` 3.1-3.4 s (DuckDB: about 70 s+).
+- Data bind-mounted from the Windows host is slow on first read here (big3x: 10 s for 288 MB, then 1.4 s):
+  Docker Desktop file sharing, not the pipeline. The scorer's disk will behave differently.
+
+Optimisation history at 20M (in Docker, tmpfs output): first exact run 14.1 s; campaigns interned (credit +
+assists 5.2 -> 0.5 s) 12.4 s; validate while parsing, id buckets then person buckets, person-hash sorting
+3.2 s; parallel part files 2.8 s; packed-key dedup and the person bit filter 2.45 s.
+
+Where the time goes at 20M now: split + validate 0.9-1.05 s (parse alone is ~0.5 s), dedup + person
+0.5 s, sessions 0.35-0.4 s, clicks 0.37 s, credit 0.12 s, everything else ~0.2 s. Ideas not yet tried:
+SWAR line/field splitting, smaller records (offsets instead of slices), a dictionary for `top_category`.
 
 ## Earlier plan
 

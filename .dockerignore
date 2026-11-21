@@ -1,8 +1,17 @@
-fixtures/
-dev/
-out/
-*.md
 .git
-dev-answer/
+*.md
+fixtures/
 tests/
+# data and outputs never go into the build context
+dev/
+dev-answer/
+data/
+out/
+output/
+scratch/
 generator/
+*.parquet
+*.duckdb
+# native build output
+native/target/
+target/
