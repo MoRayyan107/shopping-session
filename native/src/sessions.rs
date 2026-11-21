@@ -4,6 +4,7 @@ use rayon::prelude::*;
 
 use crate::events::{Event, PURCHASE};
 use crate::key::Key;
+use crate::util::{Chunks, NPARTS};
 
 pub const GAP_MS: i64 = 1_800_000;
 pub const DAY_MS: i64 = 86_400_000;
@@ -45,10 +46,21 @@ where
     });
 }
 
-pub fn sessionize(by_person: Vec<Vec<Event>>) -> Vec<Part> {
-    by_person
+/// Every person bucket taken out of `by_person` (freed as it goes), sorted and cut into sessions; parts in
+/// bucket order.
+pub fn sessionize(by_person: &Chunks<Event>) -> Vec<Part> {
+    (0..NPARTS)
         .into_par_iter()
-        .map(|mut events| {
+        .map(|b| {
+            let mut events = Vec::new();
+            by_person.take(b, &mut events);
+            sessionize_part(events)
+        })
+        .collect()
+}
+
+/// One person bucket's events, sorted and cut into sessions.
+pub fn sessionize_part(mut events: Vec<Event>) -> Part {
             group_by_person(&mut events, |e| (e.person, e.ts, &[]));
             let mut sessions: Vec<Session> = Vec::with_capacity(events.len() / 4);
             for (i, e) in events.iter().enumerate() {
@@ -78,8 +90,6 @@ pub fn sessionize(by_person: Vec<Vec<Event>>) -> Vec<Part> {
             }
             sessions.shrink_to_fit();
             Part { events, sessions }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -98,8 +108,7 @@ mod tests {
         let (a, b, c) = (Key::inline(b"a"), Key::inline(b"b"), Key::inline(b"c"));
         let ev = |p: Key, ts: i64| Event::test(p, ts, 0, 0);
         let v = vec![ev(b, 30), ev(a, 10), ev(c, 5), ev(b, 20), ev(a, 40), ev(a, 25)];
-        let parts = sessionize(vec![v]);
-        let p = &parts[0];
+        let p = &sessionize_part(v);
         let seq: Vec<(Key, i64)> = p.events.iter().map(|e| (e.person, e.ts)).collect();
         assert_eq!(seq, vec![(a, 10), (a, 25), (a, 40), (b, 20), (b, 30), (c, 5)]);
         // gaps are ms here, far under 30 minutes: one session per person, never one across persons
@@ -112,8 +121,8 @@ mod tests {
         let a = Key::inline(b"a");
         let ev = |ts: i64| Event::test(a, ts, 0, 0);
         let v = vec![ev(0), ev(GAP_MS), ev(2 * GAP_MS + 1), ev(2 * GAP_MS + 1)];
-        let parts = sessionize(vec![v]);
-        let s: Vec<(i64, u32)> = parts[0].sessions.iter().map(|s| (s.start, s.n_events)).collect();
+        let p = sessionize_part(v);
+        let s: Vec<(i64, u32)> = p.sessions.iter().map(|s| (s.start, s.n_events)).collect();
         // a gap of exactly 30 minutes stays in the session; equal timestamps always share one
         assert_eq!(s, vec![(0, 2), (2 * GAP_MS + 1, 2)]);
     }

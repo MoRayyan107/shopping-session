@@ -11,7 +11,7 @@ use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::sessions::Part;
 use crate::span::{Span, Store};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, dedup_find, map_in_order, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_find, for_each_in_order, Chunks, FxMap, Scatter, NPARTS, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -189,13 +189,11 @@ pub fn build<'a>(
     ws: i64,
     we: i64,
 ) -> Vec<Vec<Click>> {
-    let nparts = 1usize << PART_BITS;
     let bucket = |h: u64| (h >> (64 - PART_BITS)) as usize;
     assert!(camps.names.len() < VALID as usize, "too many campaigns");
-    // pass 1: split + validate every line; each piece's records ordered by click_id-hash bucket
-    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+    // pass 1: split + validate every line; each record goes straight to its click_id-hash bucket
+    let scatters = for_each_in_order(&pieces_with_file(files, first), Scatter::default, |sc: &mut Scatter<Rec>, &(file, piece)| {
             crate::raw::note_taken(piece.len());
-            recs.clear();
             for_each_row::<4, _>(piece, |line, f| {
                 let Some(id) = f[0] else { return };
                 let id = store.key(file, id);
@@ -213,24 +211,23 @@ pub fn build<'a>(
                     Some((user, camp, ts)) => Rec { id, user: store.key(file, user), line: line_sp, ts, camp_valid: camp | VALID },
                     None => Rec { id, user: Key::default(), line: line_sp, ts: 0, camp_valid: 0 },
                 };
-                recs.push(rec);
+                sc.push(bucket(rec.id.hash()), rec);
             });
-            sort_by_bucket(recs, |r| bucket(r.id.hash()))
         });
-    let by_id = Buckets::new(blocks);
-    // pass 2: dedup each id bucket; kept valid clicks go to person buckets
-    let out: Vec<(Vec<Click>, Vec<u32>)> = (0..nparts)
-        .into_par_iter()
-        .map_init(
-            || (Vec::new(), Vec::new(), Vec::new()),
-            |(recs, clicks, table): &mut (Vec<Rec>, Vec<Click>, Vec<u64>), b| {
+    let by_id = Chunks::new(scatters);
+    // pass 2: dedup each id bucket (freed once done); kept valid clicks go straight to their person bucket
+    let ids: Vec<usize> = (0..NPARTS).collect();
+    type State = (Vec<Rec>, Vec<u64>, Scatter<Click>);
+    let states = for_each_in_order(
+        &ids,
+        || (Vec::new(), Vec::new(), Scatter::default()),
+        |(recs, table, clicks): &mut State, &b| {
                 recs.clear();
-                clicks.clear();
-                by_id.gather(b, recs);
-                let emit = |r: &Rec, clicks: &mut Vec<Click>| {
+                by_id.take(b, recs);
+                let emit = |r: &Rec, clicks: &mut Scatter<Click>| {
                     if r.camp_valid & VALID != 0 {
                         let person = ptab.lookup(r.user);
-                        clicks.push(Click { person, click_id: r.id, camp: r.camp_valid & !VALID, ts: r.ts });
+                        clicks.push(bucket(person.hash()), Click { person, click_id: r.id, camp: r.camp_valid & !VALID, ts: r.ts });
                     }
                 };
                 let (alone, groups) = dedup_find(recs.len(), |i| recs[i].id.hash(), table);
@@ -275,20 +272,21 @@ pub fn build<'a>(
                         emit(&recs[first.1], clicks);
                     }
                 }
-                sort_by_bucket(clicks, |c| bucket(c.person.hash()))
-            },
-        )
-        .collect();
+        },
+    );
     drop(by_id);
-    let mut by_person = Buckets::new(out).into_vecs();
-    by_person
-        .par_iter_mut()
-        .for_each(|v| {
+    let by_person = Chunks::new(states.into_iter().map(|s| s.2).collect());
+    (0..NPARTS)
+        .into_par_iter()
+        .map(|b| {
+            let mut v = Vec::new();
+            by_person.take(b, &mut v);
             v.sort_unstable_by(|a, b| {
                 a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| cmp_click_ids(store, a.click_id, b.click_id))
-            })
-        });
-    by_person
+            });
+            v
+        })
+        .collect()
 }
 
 /// Credit and assists for every session, part by part. Sessions and clicks of a part are both ordered by

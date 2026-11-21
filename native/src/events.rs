@@ -8,15 +8,13 @@
 //! hash(person), ready for sessions. Strings are 8-byte `Span`s into the input files.
 use std::cmp::Ordering;
 
-use rayon::prelude::*;
-
 use crate::csv::{for_each_row, split_line};
 use crate::key::Key;
 use crate::links::PersonTable;
 use crate::raw::{pieces_with_file, Mapped, Row};
 use crate::span::{Span, Store};
 use crate::ts::{parse_price, parse_ts};
-use crate::util::{cmp_nulls_last, dedup_find, map_in_order, prof, sort_by_bucket, Buckets, FxMap, PART_BITS};
+use crate::util::{cmp_nulls_last, dedup_find, for_each_in_order, prof, Chunks, FxMap, Scatter, NPARTS, PART_BITS};
 
 pub const VIEW: u8 = 0;
 pub const CART: u8 = 1;
@@ -170,7 +168,7 @@ fn validate<'a>(r: &Row<'a, 7>, ws: i64, we: i64, ingest: i64) -> Option<(&'a [u
 
 pub struct Built {
     /// valid events, bucketed by the top bits of hash(person)
-    pub by_person: Vec<Vec<Event>>,
+    pub by_person: Chunks<Event>,
     /// distinct event_ids
     pub kept: usize,
 }
@@ -180,12 +178,11 @@ fn bucket(h: u64) -> usize {
     (h >> (64 - PART_BITS)) as usize
 }
 
-/// Pass 1: split + validate every line; each piece's records ordered by hash(event_id) bucket.
-pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Categories<'_>, ws: i64, we: i64) -> Buckets<Rec> {
+/// Pass 1: split + validate every line; each record goes straight to its hash(event_id) bucket.
+pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Categories<'_>, ws: i64, we: i64) -> Chunks<Rec> {
     let mut t = std::time::Instant::now();
-    let blocks: Vec<(Vec<Rec>, Vec<u32>)> = map_in_order(&pieces_with_file(files, first), Vec::new, |recs: &mut Vec<Rec>, &(file, piece)| {
+    let scatters = for_each_in_order(&pieces_with_file(files, first), Scatter::default, |sc: &mut Scatter<Rec>, &(file, piece)| {
             crate::raw::note_taken(piece.len());
-            recs.clear();
             for_each_row::<7, _>(piece, |line, f| {
                 let Some(id) = f[0] else { return };
                 let id = store.key(file, id);
@@ -213,39 +210,39 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
                         cat: 0,
                     },
                 };
-                recs.push(rec);
+                sc.push(bucket(rec.id.hash()), rec);
             });
-            sort_by_bucket(recs, |r| bucket(r.id.hash()))
         });
-    prof("events: split + validate into blocks", &mut t);
-    Buckets::new(blocks)
+    prof("events: split + validate into buckets", &mut t);
+    Chunks::new(scatters)
 }
 
-/// Pass 2: dedup each id bucket; kept valid events go to buckets by hash(person). The records are freed
-/// before the person buckets are gathered.
-pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built {
-    let nparts = 1usize << PART_BITS;
+/// Pass 2: dedup each id bucket (each bucket's records are freed once it is done); kept valid events go
+/// straight to their hash(person) bucket.
+pub fn dedup(by_id: Chunks<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Built {
     let mut t = std::time::Instant::now();
-    let out: Vec<(usize, (Vec<Event>, Vec<u32>))> = (0..nparts)
-        .into_par_iter()
-        .map_init(
-            || (Vec::new(), Vec::new(), Vec::new()),
-            |(recs, events, table): &mut (Vec<Rec>, Vec<Event>, Vec<u64>), b| {
+    let ids: Vec<usize> = (0..NPARTS).collect();
+    type State = (Vec<Rec>, Vec<u64>, Scatter<Event>, usize);
+    let states = for_each_in_order(
+        &ids,
+        || (Vec::new(), Vec::new(), Scatter::default(), 0usize),
+        |(recs, table, events, kept): &mut State, &b| {
                 recs.clear();
-                events.clear();
-                by_id.gather(b, recs);
-                let mut kept = 0usize;
-                let emit = |r: &Rec, events: &mut Vec<Event>| {
+                by_id.take(b, recs);
+                let emit = |r: &Rec, events: &mut Scatter<Event>| {
                     if (r.price_kind >> 24) as u8 != INVALID {
                         let person = ptab.lookup(r.user);
-                        events.push(Event { person, ts: r.ts, line: r.line, price_kind: r.price_kind, cat: r.cat });
+                        events.push(
+                            bucket(person.hash()),
+                            Event { person, ts: r.ts, line: r.line, price_kind: r.price_kind, cat: r.cat },
+                        );
                     }
                 };
                 let (alone, groups) = dedup_find(recs.len(), |i| recs[i].id.hash(), table);
                 // unique ids in memory order (sequential reads), then the groups of copies
                 for (i, r) in recs.iter().enumerate() {
                     if alone[i] {
-                        kept += 1;
+                        *kept += 1;
                         emit(r, events);
                     }
                 }
@@ -261,7 +258,7 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                         }
                         let run = &g[a..z];
                         a = z;
-                        kept += 1;
+                        *kept += 1;
                         // the oracle keeps the first copy by (ingest_ts as a string, then the other columns):
                         // when every copy's ingest_ts is F1 and the smallest is unique, that is run[0]
                         let unique_first = run.iter().all(|&k| recs[k].ingest != NO_INGEST)
@@ -283,15 +280,12 @@ pub fn dedup(by_id: Buckets<Rec>, ptab: &PersonTable, store: &Store<'_>) -> Buil
                         emit(&recs[first.1], events);
                     }
                 }
-                (kept, sort_by_bucket(events, |e| bucket(e.person.hash())))
-            },
-        )
-        .collect();
+        },
+    );
     drop(by_id);
-    prof("events: sort + dedup + person", &mut t);
-    let kept = out.iter().map(|o| o.0).sum();
-    let by_person = Buckets::new(out.into_iter().map(|o| o.1).collect()).into_vecs();
-    prof("events: gather person buckets", &mut t);
+    prof("events: dedup + person", &mut t);
+    let kept = states.iter().map(|s| s.3).sum();
+    let by_person = Chunks::new(states.into_iter().map(|s| s.2).collect());
     Built { by_person, kept }
 }
 

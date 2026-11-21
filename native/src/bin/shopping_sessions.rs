@@ -148,7 +148,7 @@ fn main() {
     let built = events::dedup(ev_split, &ptab, &store);
     clock.lap(
         "events dedup + person",
-        format!("{} kept, {} valid", built.kept, built.by_person.iter().map(Vec::len).sum::<usize>()),
+        format!("{} kept, {} valid", built.kept, built.by_person.len()),
     );
     if dump.wants("raw_events") || dump.wants("raw_clicks") {
         dump.raw("raw_events", ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"], &parse::<7>(&ev_files));
@@ -163,7 +163,8 @@ fn main() {
             "message ev_valid {{ {S} user_id (STRING); OPTIONAL INT64 ts_ms; {S} event_type (STRING);              {S} product_id (STRING); OPTIONAL INT64 price_cents; }}"
         ),
         || {
-            let all = || built.by_person.iter().flatten();
+            let valid = built.by_person.to_vec();
+            let all = || valid.iter();
             vec![
                 Col::OptStr(all().map(|e| Some(user_of(e))).collect()),
                 Col::OptI64(all().map(|e| Some(e.ts)).collect()),
@@ -175,7 +176,8 @@ fn main() {
     );
 
     // Stage 4: sessions, day
-    let mut parts = sessions::sessionize(built.by_person);
+    let mut parts = sessions::sessionize(&built.by_person);
+    drop(built);
     clock.lap("sessions", parts.iter().map(|p| p.sessions.len()).sum::<usize>());
     if dump.on() {
         let all_s = || parts.iter().flat_map(|p| p.sessions.iter());
