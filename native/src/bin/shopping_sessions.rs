@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
-use shopping_sessions_native::{events, links, sessions};
+use shopping_sessions_native::{daily, events, links, sessions};
 use shopping_sessions_native::pq::Col;
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
@@ -155,6 +155,14 @@ fn main() {
             },
         );
         clock.lap("dump stage 4", "ev_sessioned, sessions");
+    }
+
+    // Stage 5: user_daily
+    let ud = daily::user_daily(&parts);
+    clock.lap("user_daily", ud.iter().map(Vec::len).sum::<usize>());
+    if dump.on() {
+        dump.table("user_daily", shopping_sessions_native::pq::USER_DAILY, || daily::user_daily_cols(&ud));
+        clock.lap("dump stage 5", "user_daily");
     }
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());
