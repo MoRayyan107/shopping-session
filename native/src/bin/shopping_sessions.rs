@@ -1,13 +1,15 @@
 //! Native Shopping Sessions pipeline. Reads $DATA_DIR, writes Parquet to $OUTPUT_DIR, logs to stderr.
-//! With $NATIVE_DUMP_DIR set, every stage also writes its tables there (same names as the oracle's dumps).
+//! With $NATIVE_DUMP_DIR set, every stage also writes its tables there (same names as the oracle's dumps);
+//! $NATIVE_DUMP_TABLES limits which.
 use std::path::PathBuf;
 use std::time::Instant;
 
 use shopping_sessions_native::dump::Dumper;
-use shopping_sessions_native::{clicks, daily, events, links, sessions};
-use shopping_sessions_native::pq::{write_table, Col, CAMPAIGN_DAILY};
+use shopping_sessions_native::events::{Event, PURCHASE, TYPE_NAMES};
+use shopping_sessions_native::pq::{write_table, Col, CAMPAIGN_DAILY, USER_DAILY};
 use shopping_sessions_native::raw::{parse, Mapped};
 use shopping_sessions_native::ts::parse_ts;
+use shopping_sessions_native::{clicks, daily, events, links, sessions};
 
 fn env_path(key: &str, default: &str) -> PathBuf {
     PathBuf::from(std::env::var(key).unwrap_or_else(|_| default.to_string()))
@@ -35,6 +37,8 @@ impl Clock {
     }
 }
 
+const S: &str = "OPTIONAL BYTE_ARRAY";
+
 fn main() {
     let data = env_path("DATA_DIR", "/data");
     let out = env_path("OUTPUT_DIR", "/output");
@@ -56,60 +60,56 @@ fn main() {
     let pr_file = Mapped::file(&data.join("products.csv")).expect("map products.csv");
     let ca_file = Mapped::file(&data.join("campaigns.csv")).expect("map campaigns.csv");
     clock.lap("map files", format!("{:.0} MB", (ev_files.bytes() + ck_files.bytes() + ln_files.bytes()) as f64 / 1e6));
-    let raw_events = parse::<7>(&ev_files);
-    clock.lap("parse events", raw_events.len());
-    let raw_clicks = parse::<4>(&ck_files);
-    clock.lap("parse clicks", raw_clicks.len());
     let links = parse::<2>(&ln_files);
     let products = parse::<2>(&pr_file);
     let campaigns = parse::<2>(&ca_file);
     clock.lap("parse links, products, campaigns", format!("{} / {} / {}", links.len(), products.len(), campaigns.len()));
-    dump.raw("raw_events", ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"], &raw_events);
-    dump.raw("raw_clicks", ["click_id", "user_id", "campaign_id", "ts"], &raw_clicks);
+    // Stage 2 pass 1 (split + validate events) runs while one thread does stage 3 (linked IDs)
+    let cats = events::Categories::new(&products);
+    let (ev_split, pmap) = rayon::join(|| events::split(&ev_files, &cats, ws, we), || links::person_map(&links));
+    clock.lap(
+        "events split + validate | linked IDs",
+        format!("{} lines | {} renamed IDs", ev_split.iter().map(Vec::len).sum::<usize>(), pmap.len()),
+    );
+    let ptab = links::PersonTable::new(&pmap);
+    let built = events::dedup(ev_split, &ptab);
+    clock.lap(
+        "events dedup + person",
+        format!("{} kept, {} valid", built.kept, built.by_person.iter().map(Vec::len).sum::<usize>()),
+    );
+    if dump.wants("raw_events") || dump.wants("raw_clicks") {
+        dump.raw("raw_events", ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"], &parse::<7>(&ev_files));
+        dump.raw("raw_clicks", ["click_id", "user_id", "campaign_id", "ts"], &parse::<4>(&ck_files));
+    }
     dump.raw("links", ["user_id_a", "user_id_b"], &links);
-    if dump.on() {
-        clock.lap("dump stage 1", "raw_events, raw_clicks, links");
-    }
+    dump.table("person_map", &format!("message person_map {{ {S} id (STRING); {S} person (STRING); }}"), || {
+        vec![
+            Col::OptStr(pmap.keys().map(|k| Some(k.to_vec())).collect()),
+            Col::OptStr(pmap.values().map(|v| Some(v.to_vec())).collect()),
+        ]
+    });
+    let user_of = |e: &Event<'_>| e.row()[1].unwrap().to_vec();
+    let product_of = |e: &Event<'_>| e.row()[5].unwrap().to_vec();
+    let price_of = |e: &Event<'_>| (e.kind == PURCHASE).then_some(e.price as i64);
+    dump.table(
+        "ev_valid",
+        &format!(
+            "message ev_valid {{ {S} user_id (STRING); OPTIONAL INT64 ts_ms; {S} event_type (STRING);              {S} product_id (STRING); OPTIONAL INT64 price_cents; }}"
+        ),
+        || {
+            let all = || built.by_person.iter().flatten();
+            vec![
+                Col::OptStr(all().map(|e| Some(user_of(e))).collect()),
+                Col::OptI64(all().map(|e| Some(e.ts)).collect()),
+                Col::OptStr(all().map(|e| Some(TYPE_NAMES[e.kind as usize].to_vec())).collect()),
+                Col::OptStr(all().map(|e| Some(product_of(e))).collect()),
+                Col::OptI64(all().map(price_of).collect()),
+            ]
+        },
+    );
 
-    // Stage 2: events dedup, validate, late filter
-    let kept = events::dedup(&raw_events);
-    clock.lap("events dedup", kept.len());
-    let ev = events::validate(&raw_events, &kept, ws, we);
-    clock.lap("events validate + late", ev.len());
-    if dump.on() {
-        dump.table(
-            "ev_valid",
-            "message ev_valid { OPTIONAL BYTE_ARRAY user_id (STRING); OPTIONAL INT64 ts_ms; \
-             OPTIONAL BYTE_ARRAY event_type (STRING); OPTIONAL BYTE_ARRAY product_id (STRING); OPTIONAL INT64 price_cents; }",
-            || vec![
-                Col::OptStr(ev.iter().map(|e| Some(e.user.to_vec())).collect()),
-                Col::OptI64(ev.iter().map(|e| Some(e.ts)).collect()),
-                Col::OptStr(ev.iter().map(|e| Some(events::TYPE_NAMES[e.kind as usize].to_vec())).collect()),
-                Col::OptStr(ev.iter().map(|e| Some(e.product.to_vec())).collect()),
-                Col::OptI64(ev.iter().map(|e| (e.kind == events::PURCHASE).then_some(e.price)).collect()),
-            ],
-        );
-        clock.lap("dump stage 2", "ev_valid");
-    }
-
-    // Stage 3: linked IDs
-    let pmap = links::person_map(&links);
-    clock.lap("linked IDs", format!("{} renamed IDs", pmap.len()));
-    if dump.on() {
-        dump.table(
-            "person_map",
-            "message person_map { OPTIONAL BYTE_ARRAY id (STRING); OPTIONAL BYTE_ARRAY person (STRING); }",
-            || vec![
-                Col::OptStr(pmap.keys().map(|k| Some(k.to_vec())).collect()),
-                Col::OptStr(pmap.values().map(|v| Some(v.to_vec())).collect()),
-            ],
-        );
-        clock.lap("dump stage 3", "person_map");
-    }
-
-    // Stage 4: person, sessions, day, category
-    let prod = sessions::product_map(&products);
-    let parts = sessions::sessionize(&ev, &pmap, &prod);
+    // Stage 4: sessions, day
+    let parts = sessions::sessionize(built.by_person);
     clock.lap("sessions", parts.iter().map(|p| p.sessions.len()).sum::<usize>());
     if dump.on() {
         let all_s = || parts.iter().flat_map(|p| p.sessions.iter());
@@ -123,26 +123,30 @@ fn main() {
         };
         dump.table(
             "ev_sessioned",
-            "message ev_sessioned { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 ts_ms; OPTIONAL INT64 session_start; \
-             OPTIONAL INT32 day (DATE); OPTIONAL BYTE_ARRAY event_type (STRING); OPTIONAL BYTE_ARRAY product_id (STRING); \
-             OPTIONAL INT64 price_cents; OPTIONAL BYTE_ARRAY category (STRING); }",
+            &format!(
+                "message ev_sessioned {{ {S} person (STRING); OPTIONAL INT64 ts_ms; OPTIONAL INT64 session_start; \
+                 OPTIONAL INT32 day (DATE); {S} event_type (STRING); {S} product_id (STRING); \
+                 OPTIONAL INT64 price_cents; {S} category (STRING); }}"
+            ),
             || {
                 vec![
                     Col::OptStr(all_e().map(|(_, e)| Some(e.person.to_vec())).collect()),
-                    Col::OptI64(all_e().map(|(_, e)| Some(e.ev.ts)).collect()),
+                    Col::OptI64(all_e().map(|(_, e)| Some(e.ts)).collect()),
                     Col::OptI64(all_e().map(|(s, _)| Some(s.start)).collect()),
                     Col::OptDate(all_e().map(|(s, _)| Some(s.day)).collect()),
-                    Col::OptStr(all_e().map(|(_, e)| Some(events::TYPE_NAMES[e.ev.kind as usize].to_vec())).collect()),
-                    Col::OptStr(all_e().map(|(_, e)| Some(e.ev.product.to_vec())).collect()),
-                    Col::OptI64(all_e().map(|(_, e)| (e.ev.kind == events::PURCHASE).then_some(e.ev.price)).collect()),
-                    Col::OptStr(all_e().map(|(_, e)| Some(e.category.to_vec())).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(TYPE_NAMES[e.kind as usize].to_vec())).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(product_of(e))).collect()),
+                    Col::OptI64(all_e().map(|(_, e)| price_of(e)).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(cats.names[e.cat as usize].to_vec())).collect()),
                 ]
             },
         );
         dump.table(
             "sessions",
-            "message sessions { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 session_start; OPTIONAL INT32 day (DATE); \
-             OPTIONAL INT64 n_events; OPTIONAL INT64 revenue_cents; OPTIONAL BOOLEAN has_purchase; }",
+            &format!(
+                "message sessions {{ {S} person (STRING); OPTIONAL INT64 session_start; OPTIONAL INT32 day (DATE); \
+                 OPTIONAL INT64 n_events; OPTIONAL INT64 revenue_cents; OPTIONAL BOOLEAN has_purchase; }}"
+            ),
             || {
                 vec![
                     Col::OptStr(all_s().map(|s| Some(s.person.to_vec())).collect()),
@@ -154,21 +158,17 @@ fn main() {
                 ]
             },
         );
-        clock.lap("dump stage 4", "ev_sessioned, sessions");
     }
 
     // Stage 5: user_daily
-    let ud = daily::user_daily(&parts);
+    let ud = daily::user_daily(&parts, &cats);
     clock.lap("user_daily", ud.iter().map(Vec::len).sum::<usize>());
-    if dump.on() {
-        dump.table("user_daily", shopping_sessions_native::pq::USER_DAILY, || daily::user_daily_cols(&ud));
-        clock.lap("dump stage 5", "user_daily");
-    }
+    dump.table("user_daily", USER_DAILY, || daily::user_daily_cols(&ud));
 
     // Stage 6: clicks, credit, assists
     let camps = clicks::Campaigns::new(&campaigns);
-    let ck = clicks::valid_clicks(&raw_clicks, &pmap, &camps, ws, we);
-    clock.lap("clicks dedup + validate", ck.len());
+    let ck = clicks::build(&ck_files, &ptab, &camps, ws, we);
+    clock.lap("clicks dedup + validate + person", ck.iter().map(Vec::len).sum::<usize>());
     let cr = clicks::credit(&parts, &ck, &camps, dump.wants("session_assist"));
     clock.lap(
         "credit + assists",
@@ -181,25 +181,27 @@ fn main() {
     if dump.on() {
         dump.table(
             "ck_valid",
-            "message ck_valid { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL BYTE_ARRAY click_id (STRING); \
-             OPTIONAL BYTE_ARRAY campaign_id (STRING); OPTIONAL INT64 ts_ms; }",
+            &format!(
+                "message ck_valid {{ {S} person (STRING); {S} click_id (STRING); {S} campaign_id (STRING); \
+                 OPTIONAL INT64 ts_ms; }}"
+            ),
             || {
+                let all = || ck.iter().flatten();
                 vec![
-                    Col::OptStr(ck.iter().map(|c| Some(c.person.to_vec())).collect()),
-                    Col::OptStr(ck.iter().map(|c| Some(c.click_id.to_vec())).collect()),
-                    Col::OptStr(ck.iter().map(|c| Some(camps.names[c.camp as usize].to_vec())).collect()),
-                    Col::OptI64(ck.iter().map(|c| Some(c.ts)).collect()),
+                    Col::OptStr(all().map(|c| Some(c.person.to_vec())).collect()),
+                    Col::OptStr(all().map(|c| Some(c.click_id.to_vec())).collect()),
+                    Col::OptStr(all().map(|c| Some(camps.names[c.camp as usize].to_vec())).collect()),
+                    Col::OptI64(all().map(|c| Some(c.ts)).collect()),
                 ]
             },
         );
-        let sc = || {
-            parts.iter().zip(&cr).flat_map(|(p, c)| p.sessions.iter().zip(&c.credit))
-        };
+        let sc = || parts.iter().zip(&cr).flat_map(|(p, c)| p.sessions.iter().zip(&c.credit));
         dump.table(
             "session_credit",
-            "message session_credit { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 session_start; \
-             OPTIONAL INT32 day (DATE); OPTIONAL BOOLEAN has_purchase; OPTIONAL INT64 revenue_cents; \
-             OPTIONAL BYTE_ARRAY campaign_id (STRING); }",
+            &format!(
+                "message session_credit {{ {S} person (STRING); OPTIONAL INT64 session_start; OPTIONAL INT32 day (DATE); \
+                 OPTIONAL BOOLEAN has_purchase; OPTIONAL INT64 revenue_cents; {S} campaign_id (STRING); }}"
+            ),
             || {
                 vec![
                     Col::OptStr(sc().map(|(s, _)| Some(s.person.to_vec())).collect()),
@@ -216,8 +218,10 @@ fn main() {
         };
         dump.table(
             "session_assist",
-            "message session_assist { OPTIONAL BYTE_ARRAY person (STRING); OPTIONAL INT64 session_start; \
-             OPTIONAL INT32 day (DATE); OPTIONAL BYTE_ARRAY campaign_id (STRING); }",
+            &format!(
+                "message session_assist {{ {S} person (STRING); OPTIONAL INT64 session_start; OPTIONAL INT32 day (DATE); \
+                 {S} campaign_id (STRING); }}"
+            ),
             || {
                 vec![
                     Col::OptStr(sa().map(|(s, _)| Some(s.person.to_vec())).collect()),
@@ -227,7 +231,9 @@ fn main() {
                 ]
             },
         );
-        clock.lap("dump stage 6", "ck_valid, session_credit, session_assist");
+    }
+    if dump.on() {
+        clock.lap("stage dumps", "");
     }
 
     // Stage 7: campaign_daily, self-checks, Parquet output
@@ -247,11 +253,13 @@ fn main() {
     std::thread::scope(|s| {
         s.spawn(|| daily::write_user_daily(&out.join("user_daily/part-0.parquet"), &ud).expect("write user_daily"));
         s.spawn(|| {
-            write_table(&out.join("campaign_daily/part-0.parquet"), CAMPAIGN_DAILY, &daily::campaign_daily_cols(&cd))
+            write_table(&out.join("campaign_daily/part-0.parquet"), CAMPAIGN_DAILY, daily::campaign_daily_cols(&cd))
                 .expect("write campaign_daily")
         });
     });
     clock.lap("write parquet", format!("{} + {} rows", ud.iter().map(Vec::len).sum::<usize>(), cd.len()));
 
     eprintln!("[{:7.3}s] total", clock.start.elapsed().as_secs_f64());
+    // The outputs are closed; skip freeing gigabytes of buffers one by one.
+    std::process::exit(0);
 }

@@ -4,10 +4,12 @@ use std::cmp::Ordering;
 
 use rayon::prelude::*;
 
-use crate::raw::Row;
-use crate::sessions::Part;
+use crate::csv::{lines, split_line};
+use crate::links::PersonTable;
+use crate::raw::{pieces, Mapped, Row};
+use crate::sessions::{group_by_person, Part};
 use crate::ts::parse_ts;
-use crate::util::{cmp_nulls_last, hash_bytes, partition, prof, FxMap};
+use crate::util::{cmp_nulls_last, hash_bytes, transpose_concat, FxMap, PART_BITS};
 
 pub const WEEK_MS: i64 = 604_800_000;
 pub const ORGANIC: &[u8] = b"organic";
@@ -49,6 +51,7 @@ impl<'a> Campaigns<'a> {
 #[derive(Clone, Copy)]
 pub struct Click<'a> {
     pub person: &'a [u8],
+    pub phash: u64,
     pub click_id: &'a [u8],
     pub camp: u32,
     pub ts: i64,
@@ -61,6 +64,19 @@ pub struct Credit {
     pub assists: Vec<(u32, u32)>,
     /// assisted sessions per key(campaign, day)
     pub assist_counts: FxMap<u64, i64>,
+}
+
+/// One well-formed line with a non-empty click_id, validated.
+#[derive(Clone, Copy)]
+struct Rec<'a> {
+    idhash: u64,
+    uhash: u64,
+    id: &'a [u8],
+    user: &'a [u8],
+    line: &'a [u8],
+    ts: i64,
+    camp: u32,
+    valid: bool,
 }
 
 #[inline]
@@ -79,71 +95,99 @@ fn copy_order(a: &Row<'_, 4>, b: &Row<'_, 4>) -> Ordering {
 }
 
 /// Dedup on click_id, validate (user present, campaign known, ts in [ws - 7d, we)), map to the person.
-pub fn valid_clicks<'a>(
-    rows: &[Row<'a, 4>],
-    pmap: &FxMap<&'a [u8], &'a [u8]>,
-    camps: &Campaigns<'a>,
-    ws: i64,
-    we: i64,
-) -> Vec<Click<'a>> {
-    let parts = partition(rows.len(), |i| rows[i][0].map(hash_bytes));
-    let kept: Vec<Vec<Click<'a>>> = parts
+/// Validation runs in the parse pass (it depends only on the copy); copies are resolved like the oracle.
+/// Returned bucketed by hash(person) exactly like the events (same hash, same bits), each bucket grouped
+/// by person and sorted by (ts, click_id).
+pub fn build<'a>(files: &'a Mapped, ptab: &PersonTable<'a>, camps: &Campaigns<'a>, ws: i64, we: i64) -> Vec<Vec<Click<'a>>> {
+    let nparts = 1usize << PART_BITS;
+    let bucket = |h: u64| (h >> (64 - PART_BITS)) as usize;
+    // pass 1: split + validate every line into click_id-hash buckets
+    let blocks: Vec<Vec<Vec<Rec<'a>>>> = pieces(files)
         .par_iter()
-        .map(|idx| {
-            let mut best: FxMap<&[u8], u32> = FxMap::with_capacity_and_hasher(idx.len(), Default::default());
-            for &i in idx {
-                let r = &rows[i as usize];
-                best.entry(r[0].unwrap())
-                    .and_modify(|b| {
-                        if copy_order(r, &rows[*b as usize]) == Ordering::Less {
-                            *b = i;
-                        }
-                    })
-                    .or_insert(i);
-            }
-            best.into_values()
-                .filter_map(|i| {
-                    let r = &rows[i as usize];
-                    let user = r[1]?;
-                    let camp = *camps.idx.get(r[2]?)?;
-                    let ts = parse_ts(r[3]?)?;
+        .map(|piece| {
+            let mut out: Vec<Vec<Rec<'a>>> = (0..nparts).map(|_| Vec::with_capacity(piece.len() / 60 / nparts * 2)).collect();
+            let mut f: Row<'a, 4> = [None; 4];
+            for line in lines(piece) {
+                if !split_line(line, &mut f) {
+                    continue;
+                }
+                let Some(id) = f[0] else { continue };
+                let idhash = hash_bytes(id);
+                let valid = || -> Option<(&'a [u8], u32, i64)> {
+                    let user = f[1]?;
+                    let camp = *camps.idx.get(f[2]?)?;
+                    let ts = parse_ts(f[3]?)?;
                     if ts < ws - WEEK_MS || ts >= we {
                         return None;
                     }
-                    let person = pmap.get(user).copied().unwrap_or(user);
-                    Some(Click { person, click_id: r[0].unwrap(), camp, ts })
-                })
-                .collect()
+                    Some((user, camp, ts))
+                };
+                let rec = match valid() {
+                    Some((user, camp, ts)) => Rec { idhash, uhash: hash_bytes(user), id, user, line, ts, camp, valid: true },
+                    None => Rec { idhash, uhash: 0, id, user: &[], line, ts: 0, camp: 0, valid: false },
+                };
+                out[bucket(idhash)].push(rec);
+            }
+            out
         })
         .collect();
-    kept.into_iter().flatten().collect()
-}
-
-/// Credit and assists for every session, part by part (clicks are split with the sessions' partitioning).
-pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>], camps: &Campaigns<'a>, keep_assists: bool) -> Vec<Credit> {
-    let mut t = std::time::Instant::now();
-    let cparts = partition(clicks.len(), |i| Some(hash_bytes(clicks[i].person)));
-    assert_eq!(cparts.len(), parts.len());
-    prof("credit: partition clicks by person", &mut t);
-    let ncamp = camps.names.len();
-    let r = parts
-        .par_iter()
-        .zip(cparts.par_iter())
-        .map(|(p, cidx)| {
-            let mut ck: Vec<Click<'a>> = cidx.iter().map(|&i| clicks[i as usize]).collect();
-            ck.sort_unstable_by(|a, b| a.person.cmp(b.person).then(a.ts.cmp(&b.ts)).then(a.click_id.cmp(b.click_id)));
-            // person -> range in ck
-            let mut ranges: FxMap<&'a [u8], (u32, u32)> =
-                FxMap::with_capacity_and_hasher(ck.len() / 2, Default::default());
+    let by_id = transpose_concat(blocks);
+    // pass 2: dedup each id bucket; kept valid clicks go to person buckets
+    let out: Vec<Vec<Vec<Click<'a>>>> = by_id
+        .into_par_iter()
+        .map(|mut recs| {
+            recs.sort_unstable_by_key(|r| r.idhash);
+            let mut buckets: Vec<Vec<Click<'a>>> =
+                (0..nparts).map(|_| Vec::with_capacity(recs.len() / nparts + 16)).collect();
+            let emit = |r: &Rec<'a>, buckets: &mut Vec<Vec<Click<'a>>>| {
+                if r.valid {
+                    let (person, phash) = ptab.lookup(r.uhash, r.user);
+                    buckets[bucket(phash)].push(Click { person, phash, click_id: r.id, camp: r.camp, ts: r.ts });
+                }
+            };
             let mut i = 0;
-            while i < ck.len() {
+            while i < recs.len() {
                 let mut j = i + 1;
-                while j < ck.len() && ck[j].person == ck[i].person {
+                while j < recs.len() && recs[j].idhash == recs[i].idhash {
                     j += 1;
                 }
-                ranges.insert(ck[i].person, (i as u32, j as u32));
+                if j == i + 1 {
+                    emit(&recs[i], &mut buckets);
+                } else {
+                    // copies of one click_id (or a hash collision): order by (click_id, the oracle's copy order)
+                    let mut g: Vec<(Row<'a, 4>, usize)> = (i..j)
+                        .map(|k| {
+                            let mut f = [None; 4];
+                            split_line(recs[k].line, &mut f);
+                            (f, k)
+                        })
+                        .collect();
+                    g.sort_unstable_by(|a, b| a.0[0].cmp(&b.0[0]).then_with(|| copy_order(&a.0, &b.0)));
+                    for (n, (row, k)) in g.iter().enumerate() {
+                        if n == 0 || g[n - 1].0[0] != row[0] {
+                            emit(&recs[*k], &mut buckets);
+                        }
+                    }
+                }
                 i = j;
             }
+            buckets
+        })
+        .collect();
+    let mut by_person = transpose_concat(out);
+    by_person.par_iter_mut().for_each(|v| group_by_person(v, |c| (c.phash, c.person, c.ts, c.click_id)));
+    by_person
+}
+
+/// Credit and assists for every session, part by part. Sessions and clicks of a part are both ordered by
+/// (person hash, person), so one forward walk finds each person's clicks.
+pub fn credit(parts: &[Part<'_>], clicks: &[Vec<Click<'_>>], camps: &Campaigns<'_>, keep_assists: bool) -> Vec<Credit> {
+    assert_eq!(clicks.len(), parts.len());
+    let ncamp = camps.names.len();
+    parts
+        .par_iter()
+        .zip(clicks.par_iter())
+        .map(|(p, ck)| {
             let mut out = Credit {
                 credit: Vec::with_capacity(p.sessions.len()),
                 assists: Vec::new(),
@@ -151,15 +195,20 @@ pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>], camps: &Campaigns<'a
             };
             // stamp[c] == session number + 1 when campaign c already assists the current session
             let mut stamp = vec![0u32; ncamp];
-            let mut last_person: &[u8] = &[];
-            let mut pc: &[Click<'a>] = &[];
+            let mut j = 0usize; // first click not yet passed
+            let mut pc: &[Click<'_>] = &[];
+            let mut cur: Option<(u64, &[u8])> = None;
             for (si, s) in p.sessions.iter().enumerate() {
-                if s.person != last_person {
-                    last_person = s.person;
-                    pc = match ranges.get(s.person) {
-                        Some(&(a, b)) => &ck[a as usize..b as usize],
-                        None => &[],
-                    };
+                if cur != Some((s.phash, s.person)) {
+                    cur = Some((s.phash, s.person));
+                    while j < ck.len() && (ck[j].phash, ck[j].person) < (s.phash, s.person) {
+                        j += 1;
+                    }
+                    let mut e = j;
+                    while e < ck.len() && ck[e].phash == s.phash && ck[e].person == s.person {
+                        e += 1;
+                    }
+                    pc = &ck[j..e];
                 }
                 // clicks with ts <= start: pc[..k]
                 let k = pc.partition_point(|c| c.ts <= s.start);
@@ -187,7 +236,5 @@ pub fn credit<'a>(parts: &[Part<'a>], clicks: &[Click<'a>], camps: &Campaigns<'a
             }
             out
         })
-        .collect();
-    prof("credit: sort clicks, credit, assists", &mut t);
-    r
+        .collect()
 }

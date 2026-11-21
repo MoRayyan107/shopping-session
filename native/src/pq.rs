@@ -7,7 +7,7 @@ use std::sync::Arc;
 use parquet::basic::Compression;
 use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::errors::Result;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
@@ -21,6 +21,9 @@ pub enum Col {
     Bool(Vec<bool>),
     OptDate(Vec<Option<i32>>),
     OptBool(Vec<Option<bool>>),
+    /// internal: string columns converted for the writer
+    Bytes(Vec<ByteArray>),
+    OptBytes(Vec<ByteArray>, Vec<i16>),
 }
 
 impl Col {
@@ -34,6 +37,19 @@ impl Col {
             Col::Bool(v) => v.len(),
             Col::OptDate(v) => v.len(),
             Col::OptBool(v) => v.len(),
+            Col::Bytes(v) => v.len(),
+            Col::OptBytes(_, d) => d.len(),
+        }
+    }
+
+    fn into_bytes(self) -> Col {
+        match self {
+            Col::Str(v) => Col::Bytes(v.into_iter().map(ByteArray::from).collect()),
+            Col::OptStr(v) => {
+                let defs = v.iter().map(|s| s.is_some() as i16).collect();
+                Col::OptBytes(v.into_iter().flatten().map(ByteArray::from).collect(), defs)
+            }
+            c => c,
         }
     }
 }
@@ -41,28 +57,37 @@ impl Col {
 const ROW_GROUP: usize = 1 << 20;
 
 /// Write `cols` (matching `message_type`, e.g. "message t { REQUIRED INT32 day (DATE); }") to `path`.
-pub fn write_table(path: &Path, message_type: &str, cols: &[Col]) -> Result<()> {
+pub fn write_table(path: &Path, message_type: &str, cols: Vec<Col>) -> Result<()> {
     let schema = Arc::new(parse_message_type(message_type)?);
-    let props = Arc::new(WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).build());
+    // plain encoding, no dictionary, no statistics: the fastest to write, and readers need neither
+    let props = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build(),
+    );
     let mut w = SerializedFileWriter::new(File::create(path)?, schema, props)?;
     let rows = cols.first().map_or(0, Col::len);
+    let cols: Vec<Col> = cols.into_iter().map(Col::into_bytes).collect();
     assert!(cols.iter().all(|c| c.len() == rows), "columns of different lengths");
     let mut start = 0;
     loop {
         let end = (start + ROW_GROUP).min(rows);
         let mut rg = w.next_row_group()?;
-        for c in cols {
+        for c in &cols {
             let mut col = rg.next_column()?.expect("schema has fewer columns than data");
             match c {
-                Col::Str(v) => {
-                    let vals: Vec<ByteArray> = v[start..end].iter().map(|s| ByteArray::from(s.clone())).collect();
-                    col.typed::<ByteArrayType>().write_batch(&vals, None, None)?;
+                Col::Str(_) | Col::OptStr(_) => unreachable!("converted by into_bytes"),
+                Col::Bytes(v) => {
+                    col.typed::<ByteArrayType>().write_batch(&v[start..end], None, None)?;
                 }
-                Col::OptStr(v) => {
-                    let part = &v[start..end];
-                    let defs: Vec<i16> = part.iter().map(|s| s.is_some() as i16).collect();
-                    let vals: Vec<ByteArray> = part.iter().flatten().map(|s| ByteArray::from(s.clone())).collect();
-                    col.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None)?;
+                Col::OptBytes(v, defs) => {
+                    // v holds only the present values, in order; find the slice of v for rows start..end
+                    let d = &defs[start..end];
+                    let before = defs[..start].iter().filter(|&&x| x == 1).count();
+                    let n = d.iter().filter(|&&x| x == 1).count();
+                    col.typed::<ByteArrayType>().write_batch(&v[before..before + n], Some(d), None)?;
                 }
                 Col::Date(v) => {
                     col.typed::<Int32Type>().write_batch(&v[start..end], None, None)?;

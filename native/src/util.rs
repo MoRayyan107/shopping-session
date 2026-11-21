@@ -94,27 +94,56 @@ pub fn prof(label: &str, since: &mut std::time::Instant) {
 
 pub const PART_BITS: u32 = 8;
 
+/// blocks[b][p] -> out[p] = blocks[0][p] ++ blocks[1][p] ++ ... (parallel over p)
+pub fn transpose_concat<T: Send>(blocks: Vec<Vec<Vec<T>>>) -> Vec<Vec<T>> {
+    let nparts = blocks.first().map_or(1usize << PART_BITS, Vec::len);
+    let mut t: Vec<Vec<Vec<T>>> = (0..nparts).map(|_| Vec::with_capacity(blocks.len())).collect();
+    for b in blocks {
+        assert_eq!(b.len(), nparts);
+        for (p, v) in b.into_iter().enumerate() {
+            t[p].push(v);
+        }
+    }
+    t.into_par_iter()
+        .map(|vs| {
+            let mut out = Vec::with_capacity(vs.iter().map(Vec::len).sum());
+            for v in vs {
+                out.extend(v);
+            }
+            out
+        })
+        .collect()
+}
+
 /// Group row indices by the top PART_BITS bits of `hash(i)`: returns one Vec of indices per partition.
 pub fn partition<F>(n: usize, hash: F) -> Vec<Vec<u32>>
 where
     F: Fn(usize) -> Option<u64> + Sync,
 {
+    const BLOCK: usize = 1 << 16;
     let parts = 1usize << PART_BITS;
-    let mut keys: Vec<u64> = (0..n)
+    // pass 1: every block of indices split into its own buckets (indices ascending within a bucket)
+    let blocks: Vec<Vec<Vec<u32>>> = (0..n.div_ceil(BLOCK))
         .into_par_iter()
-        .filter_map(|i| hash(i).map(|h| ((h >> (64 - PART_BITS)) << 32) | i as u64))
+        .map(|b| {
+            let mut local: Vec<Vec<u32>> = (0..parts).map(|_| Vec::with_capacity(BLOCK / parts * 2)).collect();
+            for i in b * BLOCK..((b + 1) * BLOCK).min(n) {
+                if let Some(h) = hash(i) {
+                    local[(h >> (64 - PART_BITS)) as usize].push(i as u32);
+                }
+            }
+            local
+        })
         .collect();
-    keys.par_sort_unstable();
-    let mut out = vec![Vec::new(); parts];
-    let mut start = 0;
-    while start < keys.len() {
-        let p = (keys[start] >> 32) as usize;
-        let mut end = start;
-        while end < keys.len() && (keys[end] >> 32) as usize == p {
-            end += 1;
-        }
-        out[p] = keys[start..end].iter().map(|k| *k as u32).collect();
-        start = end;
-    }
-    out
+    // pass 2: every bucket joins its pieces in block order, so each bucket stays in index order
+    (0..parts)
+        .into_par_iter()
+        .map(|p| {
+            let mut v = Vec::with_capacity(blocks.iter().map(|b| b[p].len()).sum());
+            for b in &blocks {
+                v.extend_from_slice(&b[p]);
+            }
+            v
+        })
+        .collect()
 }

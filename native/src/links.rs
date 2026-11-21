@@ -1,7 +1,51 @@
 //! Stage 3: linked IDs (rules.md "Linked IDs"). Mirrors `pipeline/links.py::build_person_map`:
 //! edges are non-NULL, non-self links; each connected component is named by its byte-wise smallest ID.
 use crate::raw::Row;
-use crate::util::FxMap;
+use crate::util::{hash_bytes, FxMap};
+
+#[derive(Clone, Copy)]
+struct Slot<'a> {
+    hash: u64,
+    id: &'a [u8],
+    person: &'a [u8],
+    phash: u64,
+}
+
+/// The person map as an open-addressing table keyed by a precomputed hash of the ID, so a lookup for an
+/// ID that is not renamed (most of them) usually never reads the ID's bytes.
+pub struct PersonTable<'a> {
+    mask: usize,
+    slots: Vec<Option<Slot<'a>>>,
+}
+
+impl<'a> PersonTable<'a> {
+    pub fn new(map: &FxMap<&'a [u8], &'a [u8]>) -> PersonTable<'a> {
+        let cap = (map.len() * 2).next_power_of_two().max(16);
+        let mut slots: Vec<Option<Slot<'a>>> = vec![None; cap];
+        for (&id, &person) in map {
+            let hash = hash_bytes(id);
+            let mut i = hash as usize & (cap - 1);
+            while slots[i].is_some() {
+                i = (i + 1) & (cap - 1);
+            }
+            slots[i] = Some(Slot { hash, id, person, phash: hash_bytes(person) });
+        }
+        PersonTable { mask: cap - 1, slots }
+    }
+
+    /// (person, hash of person) for a user ID whose hash_bytes() is `uhash`.
+    #[inline]
+    pub fn lookup(&self, uhash: u64, user: &'a [u8]) -> (&'a [u8], u64) {
+        let mut i = uhash as usize & self.mask;
+        while let Some(s) = &self.slots[i] {
+            if s.hash == uhash && s.id == user {
+                return (s.person, s.phash);
+            }
+            i = (i + 1) & self.mask;
+        }
+        (user, uhash)
+    }
+}
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {

@@ -31,9 +31,14 @@ pub type Row<'a, const N: usize> = [Option<&'a [u8]>; N];
 
 const CHUNK: usize = 4 << 20;
 
+/// The data of every file cut into pieces of about 4 MB that end at a `\n` (headers skipped).
+pub fn pieces(m: &Mapped) -> Vec<&[u8]> {
+    m.files.iter().filter_map(|(_, f)| f.as_deref()).flat_map(|d| chunks(d, CHUNK)).collect()
+}
+
 /// Every well-formed data line of every file, in a deterministic order (file order, then line order).
 pub fn parse<const N: usize>(m: &Mapped) -> Vec<Row<'_, N>> {
-    let pieces: Vec<&[u8]> = m.files.iter().filter_map(|(_, f)| f.as_deref()).flat_map(|d| chunks(d, CHUNK)).collect();
+    let pieces = pieces(m);
     let parts: Vec<Vec<Row<'_, N>>> = pieces
         .par_iter()
         .map(|piece| {

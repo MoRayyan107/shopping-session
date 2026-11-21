@@ -2,7 +2,7 @@
 use rayon::prelude::*;
 
 use crate::clicks::{key, Campaigns, Credit};
-use crate::events::PURCHASE;
+use crate::events::{Categories, PURCHASE};
 use crate::pq::{write_table, Col, USER_DAILY};
 use crate::sessions::Part;
 use crate::util::FxMap;
@@ -17,18 +17,18 @@ pub struct UserDay<'a> {
 }
 
 /// One row per (person, day of session start).
-pub fn user_daily<'a>(parts: &[Part<'a>]) -> Vec<Vec<UserDay<'a>>> {
+pub fn user_daily<'a>(parts: &[Part<'a>], cats: &Categories<'a>) -> Vec<Vec<UserDay<'a>>> {
     parts
         .par_iter()
         .map(|p| {
             let mut out: Vec<UserDay<'a>> = Vec::new();
-            let mut cats: Vec<(&'a [u8], i64)> = Vec::new();
+            let mut amounts: Vec<(u32, i64)> = Vec::new();
             let ss = &p.sessions;
             let mut i = 0;
             while i < ss.len() {
                 let (person, day) = (ss[i].person, ss[i].day);
                 let mut row = UserDay { user: person, day, sessions: 0, events: 0, revenue: 0, top: None };
-                cats.clear();
+                amounts.clear();
                 while i < ss.len() && ss[i].person == person && ss[i].day == day {
                     let s = &ss[i];
                     row.sessions += 1;
@@ -36,10 +36,10 @@ pub fn user_daily<'a>(parts: &[Part<'a>]) -> Vec<Vec<UserDay<'a>>> {
                     row.revenue += s.revenue;
                     if s.has_purchase {
                         for e in &p.events[s.first as usize..(s.first + s.n_events) as usize] {
-                            if e.ev.kind == PURCHASE {
-                                match cats.iter_mut().find(|c| c.0 == e.category) {
-                                    Some(c) => c.1 += e.ev.price,
-                                    None => cats.push((e.category, e.ev.price)),
+                            if e.kind == PURCHASE {
+                                match amounts.iter_mut().find(|c| c.0 == e.cat) {
+                                    Some(c) => c.1 += e.price as i64,
+                                    None => amounts.push((e.cat, e.price as i64)),
                                 }
                             }
                         }
@@ -47,7 +47,11 @@ pub fn user_daily<'a>(parts: &[Part<'a>]) -> Vec<Vec<UserDay<'a>>> {
                     i += 1;
                 }
                 // highest amount; a tie goes to the byte-wise smallest category
-                row.top = cats.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0))).map(|c| c.0);
+                row.top = amounts
+                    .iter()
+                    .map(|&(c, a)| (cats.names[c as usize], a))
+                    .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+                    .map(|c| c.0);
                 out.push(row);
             }
             out
@@ -134,5 +138,5 @@ pub fn campaign_daily_cols(rows: &[CampaignDay<'_>]) -> Vec<Col> {
 }
 
 pub fn write_user_daily(path: &std::path::Path, rows: &[Vec<UserDay<'_>>]) -> parquet::errors::Result<()> {
-    write_table(path, USER_DAILY, &user_daily_cols(rows))
+    write_table(path, USER_DAILY, user_daily_cols(rows))
 }

@@ -42,14 +42,14 @@ impl Dumper {
         );
         let cols: Vec<Col> =
             (0..N).map(|i| Col::OptStr(rows.iter().map(|r| r[i].map(<[u8]>::to_vec)).collect())).collect();
-        write_table(&self.path(name), &schema, &cols).expect("write dump");
+        write_table(&self.path(name), &schema, cols).expect("write dump");
     }
 
     /// Any table: `schema` is a Parquet message type, `cols` in its order.
     pub fn table(&self, name: &str, schema: &str, cols: impl FnOnce() -> Vec<Col>) {
         if self.wants(name) {
             let cols = cols();
-            write_table(&self.path(name), schema, &cols).expect("write dump");
+            write_table(&self.path(name), schema, cols).expect("write dump");
         }
     }
 }

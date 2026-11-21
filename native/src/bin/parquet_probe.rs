@@ -14,7 +14,7 @@ fn main() {
     write_table(
         &out.join("user_daily/part-0.parquet"),
         USER_DAILY,
-        &[
+        vec![
             Col::Str(vec![b"A\tB".to_vec(), "é€😀".as_bytes().to_vec(), b"u1\r".to_vec()]),
             Col::Date(vec![d(2028, 2, 29), d(1970, 1, 1), d(2026, 10, 3)]),
             Col::I64(vec![1, 2, 3]),
@@ -27,7 +27,7 @@ fn main() {
     write_table(
         &out.join("campaign_daily/part-0.parquet"),
         CAMPAIGN_DAILY,
-        &[
+        vec![
             Col::Str(vec![b"organic".to_vec(), b"c_1".to_vec()]),
             Col::Str(vec![b"organic".to_vec(), b"search".to_vec()]),
             Col::Date(vec![d(2028, 2, 29), d(2028, 3, 1)]),
@@ -41,7 +41,7 @@ fn main() {
     write_table(
         &out.join("empty/part-0.parquet"),
         USER_DAILY,
-        &[Col::Str(vec![]), Col::Date(vec![]), Col::I64(vec![]), Col::I64(vec![]), Col::I64(vec![]), Col::OptStr(vec![])],
+        vec![Col::Str(vec![]), Col::Date(vec![]), Col::I64(vec![]), Col::I64(vec![]), Col::I64(vec![]), Col::OptStr(vec![])],
     )
     .unwrap();
     eprintln!("wrote probe files to {}", out.display());
