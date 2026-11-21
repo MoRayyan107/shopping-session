@@ -57,6 +57,12 @@ impl<'a> Categories<'a> {
         let unknown = intern(UNKNOWN, &mut names);
         Categories { names, product, unknown }
     }
+
+    /// The category id of a product.
+    #[inline]
+    pub fn of(&self, product: &[u8]) -> u32 {
+        self.product.get(product).copied().unwrap_or(self.unknown)
+    }
 }
 
 /// price (at most 10,000,000 < 2^24) in the low 24 bits, the event type in the top 8.
@@ -66,7 +72,8 @@ fn pack_pk(price: u32, kind: u8) -> u32 {
     ((kind as u32) << 24) | price
 }
 
-/// One valid event, mapped to its person (40 bytes). `line` is its raw line (used for dumps).
+/// One valid event, mapped to its person (40 bytes). `line` is its raw line (used for dumps). `cat` is only
+/// set for purchases.
 #[derive(Clone, Copy)]
 pub struct Event {
     /// the person's exact key; its bucket is the top bits of `person.hash()`
@@ -178,7 +185,9 @@ pub fn split<'a>(files: &'a Mapped, first: u32, store: &Store<'a>, cats: &Catego
                         line: line_sp,
                         ts,
                         price_kind: pack_pk(price, kind),
-                        cat: cats.product.get(product).copied().unwrap_or(cats.unknown),
+                        // only purchases need a category (top_category sums purchase prices); the dumps
+                        // recompute it from the line (`Categories::of`)
+                        cat: if kind == PURCHASE { cats.of(product) } else { 0 },
                     },
                     None => Rec {
                         idhash,

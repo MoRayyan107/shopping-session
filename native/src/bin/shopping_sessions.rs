@@ -118,28 +118,33 @@ fn main() {
     let campaigns = parse::<2>(&ca_file);
     clock.lap("parse links, products, campaigns", format!("{} / {} / {}", links.len(), products.len(), campaigns.len()));
     dump.raw("links", ["user_id_a", "user_id_b"], &links);
-    // Stage 2 pass 1 (split + validate events) runs while one thread does stage 3 (linked IDs)
+    // Stage 2 pass 1 (split + validate events) on the pool's threads, beside stage 3 (linked IDs) on a thread
+    // of its own with a 1-thread pool: inside the main pool, the person map's parallel steps would queue
+    // behind the split's workers and finish last.
     let cats = events::Categories::new(&products);
-    let (ev_split, (n_links, n_renamed, ptab)) = rayon::join(
-        || events::split(&ev_files, first[0], &store, &cats, ws, we),
-        || {
+    let (ev_split, (pairs, ptab)) = std::thread::scope(|sc| {
+        let linked = sc.spawn(|| {
             let mut t0 = std::time::Instant::now();
-            let m = links::person_map(&links);
-            shopping_sessions_native::util::prof("links: person map (one thread, beside the split)", &mut t0);
-            let t = links::PersonTable::new(&m, &store);
-            dump.table("person_map", &format!("message person_map {{ {S} id (STRING); {S} person (STRING); }}"), || {
-                vec![
-                    Col::OptStr(m.keys().map(|k| Some(k.to_vec())).collect()),
-                    Col::OptStr(m.values().map(|v| Some(v.to_vec())).collect()),
-                ]
-            });
-            (links.len(), m.len(), t)
-        },
-    );
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("person map pool");
+            let pairs = pool.install(|| links::person_pairs(&links, &store));
+            let ptab = links::PersonTable::new(&pairs);
+            shopping_sessions_native::util::prof("links: person map (own thread, beside the split)", &mut t0);
+            (pairs, ptab)
+        });
+        let ev_split = events::split(&ev_files, first[0], &store, &cats, ws, we);
+        (ev_split, linked.join().expect("person map thread"))
+    });
+    dump.table("person_map", &format!("message person_map {{ {S} id (STRING); {S} person (STRING); }}"), || {
+        vec![
+            Col::OptStr(pairs.iter().map(|p| Some(p.0.to_vec(&store))).collect()),
+            Col::OptStr(pairs.iter().map(|p| Some(p.1.to_vec(&store))).collect()),
+        ]
+    });
     clock.lap(
         "events split + validate | links, linked IDs",
-        format!("{} lines | {} links, {} renamed IDs", ev_split.len(), n_links, n_renamed),
+        format!("{} lines | {} links, {} renamed IDs", ev_split.len(), links.len(), pairs.len()),
     );
+    drop(pairs);
     let built = events::dedup(ev_split, &ptab, &store);
     clock.lap(
         "events dedup + person",
@@ -198,7 +203,7 @@ fn main() {
                     Col::OptStr(all_e().map(|(_, e)| Some(TYPE_NAMES[e.kind() as usize].to_vec())).collect()),
                     Col::OptStr(all_e().map(|(_, e)| Some(product_of(e))).collect()),
                     Col::OptI64(all_e().map(|(_, e)| price_of(e)).collect()),
-                    Col::OptStr(all_e().map(|(_, e)| Some(cats.names[e.cat as usize].to_vec())).collect()),
+                    Col::OptStr(all_e().map(|(_, e)| Some(cats.names[cats.of(e.row(&store)[5].unwrap()) as usize].to_vec())).collect()),
                 ]
             },
         );

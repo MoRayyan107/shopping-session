@@ -331,6 +331,29 @@ Verified exact: 20 unit tests (incl. every ID up to 3 bytes over {0x00, a, b, 0x
 random IDs of every length 0-15, canonical long keys); every stage table + outputs on all 61 datasets and p20m;
 the same with `NATIVE_KEY_INLINE_MAX=4` (61/61 + p20m); the side-store check `NATIVE_SPAN_MAX_LEN=4` (41/41).
 
+### 3. Categories only for purchases; the person map on keys, on its own thread: verified, committed
+
+- The split looked up every event's product in a hash map (13% of the split); only purchases need a category
+  (`top_category`). Now only purchases look it up; the `ev_sessioned` dump recomputes every event's category
+  from its line, so the dump is still a full check.
+- With the split at ~0.78 s, the old person map (0.78 s, serial, byte-keyed hash map with `memcmp` into the
+  links file) became the critical path. `links::person_pairs`: both keys of every link in parallel, interned by
+  hash partition in parallel, union-find on integers, the name by key order (inline keys order as the bytes).
+  Run inside the main pool beside the split its parallel steps queue behind the split's workers (0.86 s), and
+  before the split it costs 0.16 s on the critical path, so it runs on a thread of its own with a 1-thread
+  pool (~0.45 s there, hidden behind the split).
+
+| p20m vs `fe3d063` (3 alternating runs) | `fe3d063` | this |
+| --- | --- | --- |
+| warm whole run / pipeline | 2.69-2.74 / 2.16-2.20 s | 2.49-2.67 / 2.01-2.14 s |
+| cold whole run / pipeline | 3.01-3.08 / 2.52-2.55 s | 2.96-2.98 / 2.40-2.47 s |
+
+(This batch ran while the machine was ~0.1 s slower than in the previous one; compare within a batch only.)
+p60m cold 12g 9.6 s (base 9.0 s in the same batch; every stage, also untouched ones, 5-30% slower: noise),
+10g 17.7 s; both MATCH, anon 6.0 GB. Verified exact: 22 unit tests (person map: chains, repeats both ways,
+self links, empty sides, long and short IDs mixed); all stage tables + outputs on 61 datasets and p20m; the
+same with `NATIVE_KEY_INLINE_MAX=4` (61/61); side store (41/41).
+
 ### Environment
 
 - `D:` is a USB drive (WD P40) that Windows powers off when idle ("USB selective suspend"); each time, Docker
@@ -348,5 +371,5 @@ the same with `NATIVE_KEY_INLINE_MAX=4` (61/61 + p20m); the side-store check `NA
 
 Warm p20m now: split 0.85 s (the person map, 0.78 s on one thread, runs beside it and takes one of its 8
 threads), dedup 0.55 s, clicks 0.30 s, sessions 0.16 s, write 0.07 s, credit 0.07 s; ~0.45-0.5 s per run is
-outside the pipeline. Next: the person map on keys and in parallel; click_id spans from the line span (no
-`span_of` + cold line read per click); then dedup (sorts, copies, page faults).
+outside the pipeline (an empty container run with the same flags: 0.40-0.45 s). Next: dedup without reading
+lines back (half of dedup's CPU re-splits the copies' cold lines: 7.3% of lines are copies at p20m).
