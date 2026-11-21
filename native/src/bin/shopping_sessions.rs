@@ -176,9 +176,12 @@ fn main() {
     );
 
     // Stage 4: sessions, day
-    let mut parts = sessions::sessionize(&built.by_person);
+    let (mut parts, ud) = sessions::sessionize(&built.by_person, &cats, dump.on());
     drop(built);
-    clock.lap("sessions", parts.iter().map(|p| p.sessions.len()).sum::<usize>());
+    clock.lap(
+        "sessions + user_daily",
+        format!("{} sessions, {} rows", parts.iter().map(|p| p.sessions.len()).sum::<usize>(), ud.iter().map(Vec::len).sum::<usize>()),
+    );
     if dump.on() {
         let all_s = || parts.iter().flat_map(|p| p.sessions.iter());
         // every event with its session (events of a session are contiguous)
@@ -229,8 +232,6 @@ fn main() {
     }
 
     // Stage 5: user_daily
-    let ud = daily::user_daily(&parts, &cats);
-    clock.lap("user_daily", ud.iter().map(Vec::len).sum::<usize>());
     dump.table("user_daily", USER_DAILY, || daily::user_daily_cols(&store, &ud));
     // nothing after user_daily reads the events (credit and assists use the sessions)
     for p in parts.iter_mut() {

@@ -22,8 +22,8 @@ pub struct Session {
     pub has_purchase: bool,
 }
 
-/// One hash partition by person: its events grouped by person and sorted by ts, and its sessions in order.
-/// `events` is emptied once user_daily is built (nothing later needs it).
+/// One hash partition by person: its sessions in order, and (only for the stage dumps) its events grouped
+/// by person and sorted by ts.
 pub struct Part {
     pub events: Vec<Event>,
     pub sessions: Vec<Session>,
@@ -33,63 +33,68 @@ pub fn day_of(ms: i64) -> i32 {
     ms.div_euclid(DAY_MS) as i32
 }
 
-/// Sort a bucket so each person's rows are contiguous and in ts order: by (person key, ts, tie-break bytes).
-/// Keys are exact (equal keys <=> equal IDs), so this groups persons exactly.
-pub fn group_by_person<'a, T, F>(v: &mut [T], key: F)
-where
-    F: Fn(&T) -> (Key, i64, &'a [u8]) + Copy,
-{
-    v.sort_unstable_by(|a, b| {
-        let (pa, ta, xa) = key(a);
-        let (pb, tb, xb) = key(b);
-        pa.cmp(&pb).then(ta.cmp(&tb)).then_with(|| xa.cmp(xb))
-    });
+/// The sort key of an event: (person key, ts) packed so that u128 order is exactly (person, ts) order.
+#[inline(always)]
+fn person_ts(e: &Event) -> u128 {
+    ((e.person.raw() as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128
 }
 
-/// Every person bucket taken out of `by_person` (freed as it goes), sorted and cut into sessions; parts in
-/// bucket order.
-pub fn sessionize(by_person: &Chunks<Event>) -> Vec<Part> {
+/// Every person bucket taken out of `by_person` (freed as it goes) into a reused buffer, sorted, cut into
+/// sessions, and its user_daily rows built while it is hot; parts and rows in bucket order. A part keeps its
+/// events only when `keep_events` (the stage dumps); nothing later needs them.
+pub fn sessionize<'a>(
+    by_person: &Chunks<Event>,
+    cats: &crate::events::Categories<'a>,
+    keep_events: bool,
+) -> (Vec<Part>, Vec<Vec<crate::daily::UserDay<'a>>>) {
     (0..NPARTS)
         .into_par_iter()
-        .map(|b| {
-            let mut events = Vec::new();
-            by_person.take(b, &mut events);
-            sessionize_part(events)
+        .map_init(Vec::new, |buf: &mut Vec<Event>, b| {
+            buf.clear();
+            by_person.take(b, buf);
+            let sessions = sessions_of(buf);
+            let ud = crate::daily::user_daily_part(&sessions, buf, cats);
+            let events = if keep_events { buf.clone() } else { Vec::new() };
+            (Part { events, sessions }, ud)
         })
-        .collect()
+        .unzip()
 }
 
-/// One person bucket's events, sorted and cut into sessions.
+/// One person bucket's events, sorted and cut into sessions (tests).
 pub fn sessionize_part(mut events: Vec<Event>) -> Part {
-            group_by_person(&mut events, |e| (e.person, e.ts, &[]));
-            let mut sessions: Vec<Session> = Vec::with_capacity(events.len() / 4);
-            for (i, e) in events.iter().enumerate() {
-                let new = match sessions.last() {
-                    Some(s) => {
-                        s.person != e.person || e.ts - events[i - 1].ts > GAP_MS
-                    }
-                    None => true,
-                };
-                if new {
-                    sessions.push(Session {
-                        person: e.person,
-                        start: e.ts,
-                        day: day_of(e.ts),
-                        first: i as u32,
-                        n_events: 0,
-                        revenue: 0,
-                        has_purchase: false,
-                    });
-                }
-                let s = sessions.last_mut().unwrap();
-                s.n_events += 1;
-                if e.kind() == PURCHASE {
-                    s.revenue += e.price() as i64;
-                    s.has_purchase = true;
-                }
-            }
-            sessions.shrink_to_fit();
-            Part { events, sessions }
+    let sessions = sessions_of(&mut events);
+    Part { events, sessions }
+}
+
+/// Sort `events` by (person, ts) and cut them into sessions.
+fn sessions_of(events: &mut [Event]) -> Vec<Session> {
+    events.sort_unstable_by_key(person_ts);
+    let mut sessions: Vec<Session> = Vec::with_capacity(events.len() / 4);
+    for (i, e) in events.iter().enumerate() {
+        let new = match sessions.last() {
+            Some(s) => s.person != e.person || e.ts - events[i - 1].ts > GAP_MS,
+            None => true,
+        };
+        if new {
+            sessions.push(Session {
+                person: e.person,
+                start: e.ts,
+                day: day_of(e.ts),
+                first: i as u32,
+                n_events: 0,
+                revenue: 0,
+                has_purchase: false,
+            });
+        }
+        let s = sessions.last_mut().unwrap();
+        s.n_events += 1;
+        if e.kind() == PURCHASE {
+            s.revenue += e.price() as i64;
+            s.has_purchase = true;
+        }
+    }
+    sessions.shrink_to_fit();
+    sessions
 }
 
 #[cfg(test)]
@@ -114,6 +119,23 @@ mod tests {
         // gaps are ms here, far under 30 minutes: one session per person, never one across persons
         let s: Vec<(Key, u32)> = p.sessions.iter().map(|s| (s.person, s.n_events)).collect();
         assert_eq!(s, vec![(a, 3), (b, 2), (c, 1)]);
+    }
+
+    #[test]
+    fn packed_key_orders_as_person_then_ts() {
+        let keys = [Key::inline(b""), Key::inline(b"0"), Key::inline(b"a"), Key::inline(b"zzzzzzzzzz")];
+        let tss = [i64::MIN, -1, 0, 1, 1_753_000_000_000, i64::MAX];
+        let mut all = Vec::new();
+        for &k in &keys {
+            for &t in &tss {
+                all.push(Event::test(k, t, 0, 0));
+            }
+        }
+        for a in &all {
+            for b in &all {
+                assert_eq!(person_ts(a).cmp(&person_ts(b)), (a.person, a.ts).cmp(&(b.person, b.ts)));
+            }
+        }
     }
 
     #[test]

@@ -2,10 +2,10 @@
 use rayon::prelude::*;
 
 use crate::clicks::{key, Campaigns, Cells, Counts, Credit};
-use crate::events::{Categories, PURCHASE};
+use crate::events::{Categories, Event, PURCHASE};
 use crate::pq::{write_table, Col, USER_DAILY};
 use crate::key::Key;
-use crate::sessions::Part;
+use crate::sessions::{Part, Session};
 use crate::span::Store;
 use crate::util::FxMap;
 
@@ -18,47 +18,42 @@ pub struct UserDay<'a> {
     pub top: Option<&'a [u8]>,
 }
 
-/// One row per (person, day of session start).
-pub fn user_daily<'a>(parts: &[Part], cats: &Categories<'a>) -> Vec<Vec<UserDay<'a>>> {
-    parts
-        .par_iter()
-        .map(|p| {
-            let mut out: Vec<UserDay<'a>> = Vec::new();
-            let mut amounts: Vec<(u32, i64)> = Vec::new();
-            let ss = &p.sessions;
-            let mut i = 0;
-            while i < ss.len() {
-                let (person, day) = (ss[i].person, ss[i].day);
-                let mut row = UserDay { user: person, day, sessions: 0, events: 0, revenue: 0, top: None };
-                amounts.clear();
-                while i < ss.len() && ss[i].day == day && ss[i].person == person {
-                    let s = &ss[i];
-                    row.sessions += 1;
-                    row.events += s.n_events as i64;
-                    row.revenue += s.revenue;
-                    if s.has_purchase {
-                        for e in &p.events[s.first as usize..(s.first + s.n_events) as usize] {
-                            if e.kind() == PURCHASE {
-                                match amounts.iter_mut().find(|c| c.0 == e.cat) {
-                                    Some(c) => c.1 += e.price() as i64,
-                                    None => amounts.push((e.cat, e.price() as i64)),
-                                }
-                            }
+/// One part's rows: one per (person, day of session start); `events` are the part's events as its
+/// sessions index them.
+pub fn user_daily_part<'a>(ss: &[Session], events: &[Event], cats: &Categories<'a>) -> Vec<UserDay<'a>> {
+    let mut out: Vec<UserDay<'a>> = Vec::new();
+    let mut amounts: Vec<(u32, i64)> = Vec::new();
+    let mut i = 0;
+    while i < ss.len() {
+        let (person, day) = (ss[i].person, ss[i].day);
+        let mut row = UserDay { user: person, day, sessions: 0, events: 0, revenue: 0, top: None };
+        amounts.clear();
+        while i < ss.len() && ss[i].day == day && ss[i].person == person {
+            let s = &ss[i];
+            row.sessions += 1;
+            row.events += s.n_events as i64;
+            row.revenue += s.revenue;
+            if s.has_purchase {
+                for e in &events[s.first as usize..(s.first + s.n_events) as usize] {
+                    if e.kind() == PURCHASE {
+                        match amounts.iter_mut().find(|c| c.0 == e.cat) {
+                            Some(c) => c.1 += e.price() as i64,
+                            None => amounts.push((e.cat, e.price() as i64)),
                         }
                     }
-                    i += 1;
                 }
-                // highest amount; a tie goes to the byte-wise smallest category
-                row.top = amounts
-                    .iter()
-                    .map(|&(c, a)| (cats.names[c as usize], a))
-                    .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
-                    .map(|c| c.0);
-                out.push(row);
             }
-            out
-        })
-        .collect()
+            i += 1;
+        }
+        // highest amount; a tie goes to the byte-wise smallest category
+        row.top = amounts
+            .iter()
+            .map(|&(c, a)| (cats.names[c as usize], a))
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+            .map(|c| c.0);
+        out.push(row);
+    }
+    out
 }
 
 pub fn user_daily_cols(store: &Store<'_>, rows: &[Vec<UserDay<'_>>]) -> Vec<Col> {

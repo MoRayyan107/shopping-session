@@ -93,6 +93,12 @@ impl Key {
         self.0 & !LONG
     }
 
+    /// The key's bits (orders exactly as the key).
+    #[inline(always)]
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
     /// True for a compact key (compact keys order exactly as their IDs' bytes).
     #[inline(always)]
     pub fn is_inline(self) -> bool {
