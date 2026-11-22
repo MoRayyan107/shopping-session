@@ -246,6 +246,18 @@ fn main() {
     eprintln!("long IDs (over the inline limit): {}", store.long_ids());
     drop(ptab);
     clock.lap("clicks dedup + validate + person", ck.iter().map(Vec::len).sum::<usize>());
+    // The events, clicks and links files are read for the last time above, unless the stage dumps run or an
+    // ID's bytes are needed later (long IDs are slices of these files; compact keys decode from their bits;
+    // product and campaign names live in products.csv / campaigns.csv, which stay mapped). Then their
+    // unmapping (tens of ms of kernel work on big inputs, otherwise part of the exit) runs on a thread of
+    // its own beside the last stages.
+    #[cfg(unix)]
+    if !dump.on() && store.long_ids() == 0 {
+        std::thread::spawn(move || {
+            // SAFETY: nothing reads these files from here on (see above): no dumps, no long IDs
+            unsafe { ev_files.unmap_now() + ck_files.unmap_now() + ln_files.unmap_now() }
+        });
+    }
     let cr = clicks::credit(&parts, &ck, &camps, &cells, dump.wants("session_assist"));
     clock.lap(
         "credit + assists",

@@ -25,6 +25,26 @@ impl Mapped {
     pub fn bytes(&self) -> usize {
         self.files.iter().filter_map(|(_, m)| m.as_ref().map(|m| m.len())).sum()
     }
+
+    /// Unmap every file now (the mappings are leaked for the process's life, so nothing else unmaps them).
+    /// Returns the number of files unmapped.
+    ///
+    /// # Safety
+    /// Nothing may read these files' bytes afterwards: no row, span, key or slice into them may be used.
+    #[cfg(unix)]
+    pub unsafe fn unmap_now(&'static self) -> usize {
+        extern "C" {
+            fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+        }
+        let mut n = 0;
+        for f in self.files.iter().filter_map(|(_, f)| f.as_ref()) {
+            // SAFETY: the caller guarantees no further reads; each range is exactly one mapping
+            if unsafe { munmap(f.as_ptr() as *mut std::ffi::c_void, f.len()) } == 0 {
+                n += 1;
+            }
+        }
+        n
+    }
 }
 
 /// Ask the kernel to start reading these inputs now (madvise WILLNEED), in order, `step` bytes per call, so
